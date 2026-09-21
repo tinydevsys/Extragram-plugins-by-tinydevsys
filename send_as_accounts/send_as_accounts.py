@@ -83,7 +83,7 @@ __description__ = (
     "смена аккаунта."
 )
 __author__ = "tinydevsys"
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -198,6 +198,21 @@ class SenderAdapter(Base):
     def _st(self):
         return STATE_REGISTRY.get(self.token)
 
+    @classmethod
+    def _make_sender_view(cls, context, resources_provider):
+        """Строка списка: SenderView(context, resourcesProvider) в новых
+        версиях, SenderView(context) в старых."""
+        if resources_provider is not None:
+            order = [(context, resources_provider), (context,)]
+        else:
+            order = [(context,), (context, None)]
+        for args in order:
+            try:
+                return SenderSelectPopup.SenderView(*args)
+            except Exception:
+                continue
+        return None
+
     @joverride()
     def getItemCount(self):
         st = self._st()
@@ -225,7 +240,10 @@ class SenderAdapter(Base):
         if viewType == 0 and st["orig_count"] > 0 and st["orig_adapter"] is not None:
             return st["orig_adapter"].onCreateViewHolder(parent, 0)
         context = parent.getContext() if parent is not None else None
-        return RecyclerListView.Holder(SenderSelectPopup.SenderView(context))
+        view = self._make_sender_view(context, st.get("resources_provider"))
+        if view is None:
+            return None
+        return RecyclerListView.Holder(view)
 
     @joverride()
     def onBindViewHolder(self, holder, position):
@@ -476,22 +494,35 @@ class SendAsAccountsPlugin(BasePlugin):
                 self._diag("popup hook: SenderSelectPopup class not found")
                 return
             self._diag("popup: cls={}".format(_type_desc(cls)))
+            # Сигнатура конструктора различается между версиями клиента,
+            # поэтому ищем его по содержимому: нужен тот, где есть
+            # OnSelectCallback.
+            best = None
+            sigs = []
             try:
-                ctor = cls.getDeclaredConstructor(
-                    _jclass("android.content.Context"),
-                    _jclass("org.telegram.ui.ChatActivity"),
-                    _jclass("org.telegram.messenger.MessagesController"),
-                    _jclass("org.telegram.tgnet.TLRPC$ChatFull"),
-                    _jclass("org.telegram.tgnet.TLRPC$TL_channels_sendAsPeers"),
-                    _jclass("org.telegram.ui.Components.SenderSelectPopup$OnSelectCallback"),
-                )
-                ctor.setAccessible(True)
-                self.hook_method(ctor, PopupCtorHook(self))
+                for c in cls.getDeclaredConstructors():
+                    names = [t.getName() for t in c.getParameterTypes()]
+                    short = [n.rsplit(".", 1)[-1] for n in names]
+                    sigs.append("(" + ",".join(short) + ")")
+                    if any("OnSelectCallback" in n for n in names):
+                        if best is None or len(names) > len(
+                            best.getParameterTypes()
+                        ):
+                            best = c
+            except Exception:
+                pass
+            self._diag("popup ctors: " + (" | ".join(sigs) if sigs else "не получены"))
+            if best is None:
+                self._diag("popup hook: ctor with OnSelectCallback not found")
+                return
+            self._popup_ctor_types = [t.getName() for t in best.getParameterTypes()]
+            try:
+                best.setAccessible(True)
+                self.hook_method(best, PopupCtorHook(self))
                 self._hooks_ok += 1
                 self._diag("popup hook: ok (ctor)")
             except Exception as e_ctor:
-                # Мост не хукает отдельный конструктор — хукаем все
-                # конструкторы класса (у SenderSelectPopup их один).
+                # Мост не хукает отдельный конструктор — хукаем все.
                 self._diag(
                     "popup ctor failed: {} -> hook_all_constructors".format(
                         _exc_info(e_ctor)
@@ -735,21 +766,97 @@ class SendAsAccountsPlugin(BasePlugin):
             popup = param.thisObject
             pending = self._pending_popup_peer
             self._pending_popup_peer = None
-            chat_full = get_private_field(popup, "chatFull")
+            peer = None
             if pending is not None:
                 peer = pending
-            elif chat_full is not None:
-                peer = -int(chat_full.id)
             else:
+                # Старые версии: поле chatFull; новые — ChatActivity
+                # в аргументах конструктора.
+                chat_full = get_private_field(popup, "chatFull")
+                if chat_full is not None:
+                    peer = -int(chat_full.id)
+                else:
+                    peer = self._peer_from_ctor_args(param)
+            if peer is None:
+                self._diag("popup created: chat id не определён")
                 return
-            if peer is None or _is_encrypted(peer):
+            if _is_encrypted(peer):
+                self._diag("popup created: секретный чат — пропуск")
                 return
+            self._diag("popup created: peer={}".format(peer))
             self._remember_channels(popup)
-            self._inject_accounts(popup, peer)
+            self._inject_accounts(
+                popup, peer, self._resources_provider_from_args(self._ctor_args(param))
+            )
         except Exception as e:
             log(traceback.format_exc())
             self._diag("popup inject error: " + _exc_info(e))
             self._warn_once("popup", "Send as Accounts: не удалось добавить аккаунты в список (см. диагностику)")
+
+    def _ctor_args(self, param):
+        args = getattr(param, "args", None)
+        return list(args) if args else []
+
+    def _peer_from_ctor_args(self, param):
+        for a in self._ctor_args(param):
+            if a is None:
+                continue
+            try:
+                if a.getClass().getName() == "org.telegram.ui.ChatActivity":
+                    return int(a.getDialogId())
+            except Exception:
+                continue
+        # Запасной путь: текущий фрагмент (попап открывается поверх чата).
+        try:
+            frag = get_last_fragment()
+            if (
+                frag is not None
+                and frag.getClass().getName() == "org.telegram.ui.ChatActivity"
+            ):
+                return int(frag.getDialogId())
+        except Exception:
+            pass
+        return None
+
+    def _resources_provider_from_args(self, objs):
+        for o in objs or []:
+            if o is None:
+                continue
+            try:
+                if "ResourcesProvider" in o.getClass().getName():
+                    return o
+            except Exception:
+                continue
+        return None
+
+    def _build_popup_args(self, context, parent_fragment, controller, send_as, callback, resources_provider):
+        """Аргументы конструктора SenderSelectPopup под сигнатуру,
+        обнаруженную в _hook_popup (между версиями она различается)."""
+        names = getattr(self, "_popup_ctor_types", None)
+        if not names:
+            # Старая 6-арг. сигнатура.
+            return [context, parent_fragment, controller, None, send_as, callback]
+        args = []
+        for n in names:
+            if n == "android.content.Context":
+                args.append(context)
+            elif n == "org.telegram.ui.ChatActivity":
+                args.append(parent_fragment)
+            elif n == "org.telegram.messenger.MessagesController":
+                args.append(controller)
+            elif n == "boolean":
+                args.append(False)
+            elif n.endswith("$Peer"):
+                args.append(None)
+            elif "sendAsPeers" in n:
+                args.append(send_as)
+            elif "OnSelectCallback" in n:
+                args.append(callback)
+            elif "ResourcesProvider" in n:
+                args.append(resources_provider)
+            else:
+                args.append(None)
+        return args
 
     # ------------------------------------------------------------------
     # Диагностика
@@ -833,7 +940,7 @@ class SendAsAccountsPlugin(BasePlugin):
         except Exception:
             log(traceback.format_exc())
 
-    def _inject_accounts(self, popup, peer):
+    def _inject_accounts(self, popup, peer, resources_provider=None):
         try:
             recycler = get_private_field(popup, "recyclerView")
             if recycler is None:
@@ -872,6 +979,7 @@ class SendAsAccountsPlugin(BasePlugin):
                 "peer": peer,
                 "popup": popup,
                 "orig_listener": get_private_field(recycler, "onItemClickListener"),
+                "resources_provider": resources_provider,
             }
             token = self._register_state(state)
 
@@ -953,14 +1061,17 @@ class SendAsAccountsPlugin(BasePlugin):
             controller = MessagesController.getInstance(UserConfig.selectedAccount)
             empty = TLRPC.TL_channels_sendAsPeers()
 
+            resources_provider = get_private_field(enter_view, "resourcesProvider")
             self._pending_popup_peer = dialog_id
             popup = SenderSelectPopup(
-                context,
-                parent_fragment,
-                controller,
-                None,
-                empty,
-                SelectCallbackProxy.new_instance(),
+                *self._build_popup_args(
+                    context,
+                    parent_fragment,
+                    controller,
+                    empty,
+                    SelectCallbackProxy.new_instance(),
+                    resources_provider,
+                )
             )
             popup.setOutsideTouchable(True)
             popup.setFocusable(True)

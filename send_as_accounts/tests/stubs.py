@@ -339,6 +339,9 @@ class _FakeClass:
             raise AttributeError("no ctor on {}".format(self._name))
         return c
 
+    def getDeclaredConstructors(self):
+        return list(self._ctors.values())
+
 
 class _FakeType:
     """Модель java.lang.Class (для getParameterTypes)."""
@@ -1199,7 +1202,7 @@ class _SimpleText:
 
 
 class _SenderView:
-    def __init__(self, context=None):
+    def __init__(self, context=None, resources_provider=None):
         self.avatar = _SimpleAvatarView()
         self.title = _SimpleText("title")
         self.subtitle = _SimpleText("subtitle")
@@ -1251,11 +1254,14 @@ class _OrigClick:
         self.popup = popup
         self.clicked = []
 
+    default_send_as = None
+
     def onItemClick(self, view, position):
         self.clicked.append(position)
         peer = self.popup.sendAsPeers.peers[position].peer
-        if self.popup.chatFull is not None:
-            self.popup.chatFull.default_send_as = peer
+        # Новая версия приложения запоминает выбранный отправитель
+        # (в оригинале — chatFull.default_send_as + setDefaultSendAs).
+        self.default_send_as = peer
 
 
 class _PopupContent:
@@ -1276,31 +1282,55 @@ class SenderSelectPopup:
     class OnSelectCallback:
         pass
 
-    def __init__(self, context, parent_fragment, controller, chat_full, send_as_peers, select_callback):
+    def __init__(self, context, parent_fragment, controller, is_channel, def_peer, send_as_peers, select_callback, resources_provider=None):
         self.context = context
-        self.parent_fragment = parent_fragment
+        self.parentFragment = parent_fragment
         self.controller = controller
-        self.chatFull = chat_full
+        self.defPeer = def_peer
         self.sendAsPeers = send_as_peers
         self.selectCallback = select_callback
+        self.resourcesProvider = resources_provider
         self.recyclerView = _RecyclerListView()
-        self.recyclerView._adapter = _OrigAdapter(send_as_peers.peers, controller, chat_full, self)
+        self.recyclerView._adapter = _OrigAdapter(send_as_peers.peers, controller, None, self)
         self.recyclerView._click = _OrigClick(self)
         self._dismissed = False
         SenderSelectPopup.LAST = self
         # Имитация Xposed-хука на конструктор.
+        ctor_args = (
+            context,
+            parent_fragment,
+            controller,
+            is_channel,
+            def_peer,
+            send_as_peers,
+            select_callback,
+            resources_provider,
+        )
         for h in list(POPUP_CTOR_HOOKS):
-            h.after_hooked_method(_CtorParam(self))
+            h.after_hooked_method(_CtorParam(self, ctor_args))
 
 
 class _CtorParam:
-    def __init__(self, this_object):
+    def __init__(self, this_object, args=None):
         self.thisObject = this_object
-        self.args = []
+        self.args = args or []
         self.method = None
 
     def setResult(self, value):
         pass
+
+
+class FakeChatActivity:
+    """Имитация ChatActivity (родительский фрагмент попапа)."""
+
+    def __init__(self, dialog_id):
+        self._dialog_id = dialog_id
+
+    def getDialogId(self):
+        return self._dialog_id
+
+    def getClass(self):
+        return _FakeClass("org.telegram.ui.ChatActivity")
 
 
 recycler_list_view = _RecyclerListView
@@ -1321,6 +1351,8 @@ _TL_CHAT_FULL = _FakeClass("org.telegram.tgnet.TLRPC$ChatFull")
 _TL_SEND_AS_PEERS = _FakeClass("org.telegram.tgnet.TLRPC$TL_channels_sendAsPeers")
 _ON_SELECT_CALLBACK = _FakeClass("org.telegram.ui.Components.SenderSelectPopup$OnSelectCallback")
 _BOOLEAN_TYPE = _FakeClass("boolean")
+_TL_PEER = _FakeClass("org.telegram.tgnet.TLRPC$Peer")
+_THEME_RP = _FakeClass("org.telegram.ui.ActionBar.Theme$ResourcesProvider")
 
 
 def default_find_class(name):
@@ -1338,15 +1370,29 @@ def default_find_class(name):
     if name not in default_find_class._cache:
         cls = _FakeClass(name)
         if name == "org.telegram.ui.Components.SenderSelectPopup":
-            ctor = _FakeMethod("<init>", [])
+            ctor = _FakeMethod(
+                "<init>",
+                [
+                    _CONTEXT,
+                    _CHAT_ACTIVITY,
+                    _MESSAGES_CONTROLLER,
+                    _BOOLEAN_TYPE,
+                    _TL_PEER,
+                    _TL_SEND_AS_PEERS,
+                    _ON_SELECT_CALLBACK,
+                    _THEME_RP,
+                ],
+            )
             ctor._is_popup_ctor = True
             cls._ctors[(
                 _CONTEXT,
                 _CHAT_ACTIVITY,
                 _MESSAGES_CONTROLLER,
-                _TL_CHAT_FULL,
+                _BOOLEAN_TYPE,
+                _TL_PEER,
                 _TL_SEND_AS_PEERS,
                 _ON_SELECT_CALLBACK,
+                _THEME_RP,
             )] = ctor
         elif name == "org.telegram.ui.Components.ChatActivityEnterView":
             cls._methods["createSenderSelectView"] = _FakeMethod("createSenderSelectView", [])

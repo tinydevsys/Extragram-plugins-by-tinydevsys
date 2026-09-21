@@ -19,6 +19,7 @@ import stubs as S  # noqa: E402
 from stubs import (  # noqa: E402
     AlertDialogBuilder,
     BulletinHelper,
+    FakeChatActivity,
     LaunchActivity,
     MessagesController,
     SenderSelectPopup,
@@ -140,7 +141,7 @@ def test_metadata():
                     pass
     check("id", consts.get("__id__") == "send_as_accounts")
     check("name", bool(consts.get("__name__")))
-    check("version", consts.get("__version__") == "1.0.2")
+    check("version", consts.get("__version__") == "1.0.3")
     check("app_version", "12.5.1" in consts.get("__app_version__", ""))
     check("sdk_version", "1.4.4.3" in consts.get("__sdk_version__", ""))
     check("icon", consts.get("__icon__", "").startswith("exteraPlugins"))
@@ -476,11 +477,11 @@ def test_popup_injection():
 
     send_as = TLRPC.TL_channels_sendAsPeers()
     send_as.peers = [TLRPC.TL_sendAsPeer(peer_ch1), TLRPC.TL_sendAsPeer(peer_ch2)]
-    chat_full = TLRPC.ChatFull(chat_id)
 
     # При создании попапа «срабатывает» хук на конструктор.
+    # Новая сигнатура: чат определяется по ChatActivity в аргументах.
     # Порядок: сначала 4 аккаунта (позиции 0-3), потом 2 канала (4-5).
-    popup = SenderSelectPopup(None, None, mc0, chat_full, send_as, None)
+    popup = SenderSelectPopup(None, FakeChatActivity(-chat_id), mc0, False, None, send_as, None)
     recycler = popup.recyclerView
     adapter = recycler.getAdapter()
     check("adapter replaced", type(adapter) is MOD.SenderAdapter)
@@ -520,7 +521,7 @@ def test_popup_injection():
     recycler.onItemClickListener.onItemClick(None, 4)
     check("orig click delegated", len(state["orig_listener"].clicked) == 1)
     check("sender cleared on channel select", p.get_sender_account(-chat_id) is None)
-    check("chatFull default set to channel", chat_full.default_send_as is peer_ch1)
+    check("orig default set to channel", state["orig_listener"].default_send_as is peer_ch1)
 
     # клик по Bob (позиция 1)
     recycler.onItemClickListener.onItemClick(None, 1)
@@ -554,7 +555,7 @@ def test_popup_injection():
     p2 = make_plugin()
     setup_accounts()
     p2.set_setting("hide_channels", True)
-    popup2 = SenderSelectPopup(None, None, mc0, TLRPC.ChatFull(chat_id), send_as, None)
+    popup2 = SenderSelectPopup(None, FakeChatActivity(-chat_id), mc0, False, None, send_as, None)
     a2 = popup2.recyclerView.getAdapter()
     check("hide channels: accounts only", a2.getItemCount() == 4, str(a2.getItemCount()))
 
@@ -562,9 +563,17 @@ def test_popup_injection():
     p3 = make_plugin()
     setup_accounts()
     p3.set_setting("hidden_channels", {"9001": True})
-    popup3 = SenderSelectPopup(None, None, mc0, TLRPC.ChatFull(chat_id), send_as, None)
+    popup3 = SenderSelectPopup(None, FakeChatActivity(-chat_id), mc0, False, None, send_as, None)
     a3 = popup3.recyclerView.getAdapter()
     check("hidden channel: 1 orig + 4 acc", a3.getItemCount() == 5, str(a3.getItemCount()))
+
+
+    # v1.0.3: сигнатура конструктора обнаружена динамически, попап
+    # подключён через фолбэк, id чата взят из аргументов конструктора.
+    diag_text = "\n".join(p._diag_log)
+    check("popup ctors listed", "popup ctors: " in diag_text, diag_text)
+    check("peer from ctor args", "popup created: peer=-777" in diag_text, diag_text)
+    check("8-arg ctor detected", "OnSelectCallback" in diag_text, diag_text)
 
 
 def test_private_popup():
