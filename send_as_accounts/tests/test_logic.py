@@ -140,7 +140,7 @@ def test_metadata():
                     pass
     check("id", consts.get("__id__") == "send_as_accounts")
     check("name", bool(consts.get("__name__")))
-    check("version", consts.get("__version__") == "1.0.0")
+    check("version", consts.get("__version__") == "1.0.1")
     check("app_version", "12.5.1" in consts.get("__app_version__", ""))
     check("sdk_version", "1.4.4.3" in consts.get("__sdk_version__", ""))
     check("icon", consts.get("__icon__", "").startswith("exteraPlugins"))
@@ -395,23 +395,29 @@ def test_popup_injection():
     chat_full = TLRPC.ChatFull(chat_id)
 
     # При создании попапа «срабатывает» хук на конструктор.
+    # Порядок: сначала 4 аккаунта (позиции 0-3), потом 2 канала (4-5).
     popup = SenderSelectPopup(None, None, mc0, chat_full, send_as, None)
     recycler = popup.recyclerView
     adapter = recycler.getAdapter()
     check("adapter replaced", type(adapter) is MOD.SenderAdapter)
-    check("count = 2 + 4", adapter.getItemCount() == 6, str(adapter.getItemCount()))
-    check("viewtype orig", adapter.getItemViewType(0) == 0)
-    check("viewtype account", adapter.getItemViewType(2) == 1)
+    check("count = 4 acc + 2 ch", adapter.getItemCount() == 6, str(adapter.getItemCount()))
+    check("viewtype account first", adapter.getItemViewType(0) == 1)
+    check("viewtype channel last", adapter.getItemViewType(4) == 0)
 
     seen = p.get_setting("seen_channels", {})
     check("seen channels", seen.get("9001") == "Канал 1" and seen.get("9002") == "Канал 2")
 
     row = adapter.onCreateViewHolder(None, 1)
-    adapter.onBindViewHolder(row, 2)
+    adapter.onBindViewHolder(row, 0)
     check("row title current", "Alice" in row.itemView.title.getText())
     check("row not greyed", row.itemView.getAlpha() == 1.0)
 
-    pos_carol = 2 + [0, 1, 2, 3].index(2)
+    # канал на позиции 4 (оригинальный индекс 0)
+    row_ch = adapter.onCreateViewHolder(None, 0)
+    adapter.onBindViewHolder(row_ch, 4)
+    check("channel row via orig adapter", row_ch.itemView.title.getText() == "Канал 1")
+
+    pos_carol = [0, 1, 2, 3].index(2)  # Carol = accounts[2], позиция 2
     row2 = adapter.onCreateViewHolder(None, 1)
     adapter.onBindViewHolder(row2, pos_carol)
     check("kicked greyed", row2.itemView.getAlpha() == 0.5)
@@ -425,15 +431,15 @@ def test_popup_injection():
             break
     check("state registered", state is not None)
 
-    # клик по каналу -> делегирование + сброс отправителя
+    # клик по каналу (позиция 4) -> делегирование + сброс отправителя
     p._apply_sender(-chat_id, 1)
-    recycler.onItemClickListener.onItemClick(None, 0)
+    recycler.onItemClickListener.onItemClick(None, 4)
     check("orig click delegated", len(state["orig_listener"].clicked) == 1)
     check("sender cleared on channel select", p.get_sender_account(-chat_id) is None)
     check("chatFull default set to channel", chat_full.default_send_as is peer_ch1)
 
-    # клик по Bob (позиция 2+1)
-    recycler.onItemClickListener.onItemClick(None, 3)
+    # клик по Bob (позиция 1)
+    recycler.onItemClickListener.onItemClick(None, 1)
     check("bob selected", p.get_sender_account(-chat_id) == 1)
     check(
         "selection bulletin",
@@ -442,11 +448,11 @@ def test_popup_injection():
         and "Отправлять от «Bob" in last_bulletin()[1],
     )
 
-    # клик по текущему аккаунту — сброс
-    recycler.onItemClickListener.onItemClick(None, 2)
+    # клик по текущему аккаунту (позиция 0) — сброс
+    recycler.onItemClickListener.onItemClick(None, 0)
     check("current resets", p.get_sender_account(-chat_id) is None)
 
-    # клик по kicked (Carol) — предложение вступить (диалог, не bulletin)
+    # клик по kicked (Carol, позиция 2) — предложение вступить (диалог, не bulletin)
     BulletinHelper.reset()
     AlertDialogBuilder.SHOWN = []
     recycler.onItemClickListener.onItemClick(None, pos_carol)
@@ -454,10 +460,10 @@ def test_popup_injection():
     check("kicked -> join dialog", len(AlertDialogBuilder.SHOWN) == 1)
     check("no bulletin for join", len(BulletinHelper.SHOWN) == 0)
 
-    # долгое нажатие на аккаунт — полная смена
+    # долгое нажатие на Bob (позиция 1) — полная смена
     la = LaunchActivity()
     LaunchActivity.instance = la
-    recycler.onItemLongClickListener.onItemClick(None, 3)
+    recycler.onItemLongClickListener.onItemClick(None, 1)
     check("long press switches app", la.switched == [(1, True)])
 
     # hide channels
@@ -711,6 +717,73 @@ def test_update_send_as_avatar():
     check("visible", ev.senderSelectView.visible == S.JView.VISIBLE)
 
 
+def test_private_button():
+    print("[private button]")
+    p = make_plugin()
+    setup_accounts()
+    S.NotificationCenter.reset()
+    p.set_setting("switch_mode", MOD.MODE_SWITCH)
+    p._apply_sender(555, 1)
+    check("private sender saved", p.get_sender_account(555) == 1)
+    posted = [
+        args for (_, nid, args) in S.NotificationCenter.POSTED
+        if nid == S.NotificationCenter.updateDefaultSendAsPeer
+    ]
+    check("send-as notification posted", any(a[0] == 555 for a in posted))
+
+    # Приложение вызывает updateSendAsButton -> after-хук создаёт/показывает кнопку
+    class _Anim:
+        def cancel(self):
+            pass
+
+    class FakeView:
+        def __init__(self):
+            self.avatar_obj = None
+            self.visible = None
+            self._tag = _Anim()
+
+        def getTag(self):
+            return self._tag
+
+        def setTag(self, t):
+            self._tag = t
+
+        def setAvatar(self, u):
+            self.avatar_obj = u
+
+        def setVisibility(self, v):
+            self.visible = v
+
+        def setAlpha(self, a):
+            pass
+
+        def setTranslationX(self, x):
+            pass
+
+    class FakeEnterView:
+        dialog_id = 555
+        senderSelectView = FakeView()
+
+    ev = FakeEnterView()
+    p._on_update_send_as_after(FakeParam(this_object=ev))
+    check(
+        "private button avatar",
+        ev.senderSelectView.avatar_obj is not None
+        and ev.senderSelectView.avatar_obj.id == 101,
+    )
+    check("private button visible", ev.senderSelectView.visible == S.JView.VISIBLE)
+    check("animator cancelled", ev.senderSelectView.getTag() is None)
+
+    # Сброс отправителя -> уведомление на скрытие
+    S.NotificationCenter.reset()
+    p._clear_sender(555)
+    posted = [
+        args for (_, nid, args) in S.NotificationCenter.POSTED
+        if nid == S.NotificationCenter.updateDefaultSendAsPeer
+    ]
+    check("hide notification posted", any(a[0] == 555 for a in posted))
+
+
 def test_diag():
     print("[diag]")
     p = make_plugin()
@@ -743,6 +816,7 @@ def main():
     test_settings()
     test_sender_view_wrap()
     test_update_send_as_avatar()
+    test_private_button()
     test_diag()
 
     print()

@@ -74,6 +74,18 @@ class Object:
     TYPE = "java.lang.Object"
 
 
+class Class:
+    """Модель java.lang.Class: статический forName возвращает _FakeClass."""
+
+    @staticmethod
+    def forName(name):
+        # Ленивая ссылка: default_find_class определён в конце модуля.
+        return default_find_class(name)
+
+    def __init__(self, instance=None):
+        self._instance = instance
+
+
 Boolean.TYPE = "boolean"
 Integer.TYPE = "int"
 Long.TYPE = "long"
@@ -81,6 +93,7 @@ java.lang.Boolean = Boolean
 java.lang.Integer = Integer
 java.lang.Long = Long
 java.lang.Object = Object
+java.lang.Class = Class
 
 android = _mod("android")
 android_view = _mod("android.view")

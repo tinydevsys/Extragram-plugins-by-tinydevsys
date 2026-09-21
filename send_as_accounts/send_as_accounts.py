@@ -42,8 +42,9 @@ from ui.settings import Divider, Header, Input, Selector, Switch, Text
 
 from extera_utils.classes import Base, java_subclass, jfield, joverride
 
-from java import jarray, jclass
+from java import jarray
 from java.lang import Boolean as JBoolean
+from java.lang import Class as JClass
 from java.lang import Integer as JInteger
 from java.lang import Long as JLong
 from java.lang import Object as JObject
@@ -79,7 +80,7 @@ __description__ = (
     "смена аккаунта."
 )
 __author__ = "tinydevsys"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -138,16 +139,35 @@ def _is_banned(chat):
 
 
 def _jclass(name):
-    """Объект java.lang.Class для рефлексии (getDeclaredMethod и т.п.).
+    """Настоящий объект java.lang.Class для рефлексии.
 
-    ВАЖНО: в этой версии SDK find_class возвращает Python-type обёртку,
-    у которой НЕТ методов рефлексии — только jclass даёт настоящий
-    объект java.lang.Class.
+    ВАЖНО: в Chaquopy и find_class(), и jclass() возвращают Python-тип
+    (обёртку), у которого НЕТ методов рефлексии (getDeclaredMethod и
+    т.п.). Настоящий java.lang.Class даёт только статический вызов
+    java.lang.Class.forName(...).
     """
     try:
-        return jclass(name)
+        cls = JClass.forName(name)
+        if cls is not None and hasattr(cls, "getDeclaredMethod"):
+            return cls
     except Exception:
-        return None
+        pass
+    # Резерв: вытащить Class-экземпляр из Python-типа (внутренности Chaquopy).
+    try:
+        pytype = find_class(name)
+        j_klass = getattr(pytype, "_chaquopy_j_klass", None)
+        if j_klass is not None:
+            return JClass(instance=j_klass)
+    except Exception:
+        pass
+    return None
+
+
+def _type_desc(obj):
+    try:
+        return "{}(reflect={})".format(type(obj).__name__, hasattr(obj, "getDeclaredMethod"))
+    except Exception:
+        return repr(obj)[:60]
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +199,8 @@ class SenderAdapter(Base):
         st = self._st()
         if st is None:
             return 0
-        return 0 if position < st["orig_count"] else 1
+        # Сначала личные аккаунты (viewType 1), потом каналы (viewType 0).
+        return 1 if position < len(st["accounts"]) else 0
 
     @joverride()
     def onCreateViewHolder(self, parent, viewType):
@@ -196,11 +217,11 @@ class SenderAdapter(Base):
         st = self._st()
         if st is None:
             return
-        if position < st["orig_count"]:
-            st["orig_adapter"].onBindViewHolder(holder, st["orig_positions"][position])
+        n_acc = len(st["accounts"])
+        if position < n_acc:
+            st["plugin"]._bind_account_row(holder.itemView, st["accounts"][position], st["peer"])
         else:
-            acc = st["accounts"][position - st["orig_count"]]
-            st["plugin"]._bind_account_row(holder.itemView, acc, st["peer"])
+            st["orig_adapter"].onBindViewHolder(holder, st["orig_positions"][position - n_acc])
 
 
 @java_subclass(JObject, RecyclerListView.OnItemClickListener)
@@ -215,16 +236,17 @@ class ClickProxy(Base):
         if st is None:
             return
         plugin = st["plugin"]
+        n_acc = len(st["accounts"])
         try:
-            if position < st["orig_count"]:
+            if position < n_acc:
+                acc = st["accounts"][position]
+                plugin._on_account_row_tapped(st["peer"], acc, st["popup"], view)
+            else:
                 # Сначала сбрасываем сохранённого аккаунта, чтобы оригинальный
                 # поток (updateSendAsButton) уже не подменял аватар обратно.
                 plugin._on_original_peer_selected(st["peer"])
                 if st["orig_listener"] is not None:
-                    st["orig_listener"].onItemClick(view, st["orig_positions"][position])
-            else:
-                acc = st["accounts"][position - st["orig_count"]]
-                plugin._on_account_row_tapped(st["peer"], acc, st["popup"], view)
+                    st["orig_listener"].onItemClick(view, st["orig_positions"][position - n_acc])
         except Exception:
             log(traceback.format_exc())
 
@@ -242,8 +264,9 @@ class LongClickProxy(Base):
             return False
         plugin = st["plugin"]
         try:
-            if position >= st["orig_count"] and plugin.get_setting("long_press_switch", True):
-                acc = st["accounts"][position - st["orig_count"]]
+            n_acc = len(st["accounts"])
+            if position < n_acc and plugin.get_setting("long_press_switch", True):
+                acc = st["accounts"][position]
                 if st["popup"] is not None:
                     try:
                         st["popup"].dismiss()
@@ -437,6 +460,7 @@ class SendAsAccountsPlugin(BasePlugin):
                 self.log("Send as Accounts: SenderSelectPopup class not found")
                 self._diag("popup hook: SenderSelectPopup class not found")
                 return
+            self._diag("popup: cls={}".format(_type_desc(cls)))
             ctor = cls.getDeclaredConstructor(
                 _jclass("android.content.Context"),
                 _jclass("org.telegram.ui.ChatActivity"),
@@ -687,6 +711,7 @@ class SendAsAccountsPlugin(BasePlugin):
                 if UserConfig.isValidAccount(a)
             ]
             lines = [
+                "Версия: {}".format(__version__),
                 "Аккаунтов в приложении: {} (текущий: {})".format(
                     len(accounts), UserConfig.selectedAccount
                 ),
@@ -971,8 +996,26 @@ class SendAsAccountsPlugin(BasePlugin):
                     m.invoke(enter_view)
                     view = get_private_field(enter_view, "senderSelectView")
             if view is not None:
-                view.setAvatar(user)
+                # Отменяем возможную анимацию скрытия (в ЛС оригинальный код
+                # прячет кнопку, т.к. ChatFull нет) — иначе она сработает
+                # через 150 мс и уберёт нашу кнопку.
+                try:
+                    anim = view.getTag()
+                    if anim is not None and hasattr(anim, "cancel"):
+                        anim.cancel()
+                        view.setTag(None)
+                except Exception:
+                    pass
+                try:
+                    view.setAvatar(user)
+                except Exception:
+                    pass
                 view.setVisibility(JView.VISIBLE)
+                try:
+                    view.setAlpha(1.0)
+                    view.setTranslationX(0)
+                except Exception:
+                    pass
         except Exception:
             log(traceback.format_exc())
 
@@ -1005,6 +1048,10 @@ class SendAsAccountsPlugin(BasePlugin):
 
             if peer is not None and peer < 0:
                 self._set_local_default_send_as(peer, acc)
+            elif peer is not None and peer > 0:
+                # ЛС/бот: ChatFull нет, кнопку показывает хук на
+                # updateSendAsButton после уведомления updateDefaultSendAsPeer.
+                self._post_send_as_update(peer)
 
             self._info("Отправлять от «{}»".format(self._account_name(acc)))
         except Exception:
@@ -1026,7 +1073,10 @@ class SendAsAccountsPlugin(BasePlugin):
                 full = MessagesController.getInstance(UserConfig.selectedAccount).getChatFull(-peer)
                 if full is not None and full.default_send_as is not None:
                     full.default_send_as = None
-                    self._post_send_as_update(peer)
+                self._post_send_as_update(peer)
+            elif peer > 0:
+                # ЛС/бот: попросим оригинальный код скрыть кнопку.
+                self._post_send_as_update(peer)
         except Exception:
             log(traceback.format_exc())
 
