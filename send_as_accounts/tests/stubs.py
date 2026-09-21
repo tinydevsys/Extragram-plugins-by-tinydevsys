@@ -306,6 +306,20 @@ class _FakeClass:
         return c
 
 
+class _FakeType:
+    """Модель java.lang.Class (для getParameterTypes)."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def getName(self):
+        return self._name
+
+
+def _t(name):
+    return _FakeType(name)
+
+
 class _FakeMethod:
     def __init__(self, name, param_types, instance=None):
         self._name = name
@@ -1297,9 +1311,11 @@ def default_find_class(name):
                 "updateSendAsButton", [_BOOLEAN_TYPE]
             )
         elif name == "org.telegram.messenger.SendMessagesHelper":
-            cls._methods["sendMessage_27"] = _FakeMethod("sendMessage", ["x"] * 27)
+            cls._methods["sendMessage_27"] = _FakeMethod("sendMessage", [_t("x")] * 27)
             cls._methods["sendMessage_7"] = _FakeMethod(
-                "sendMessage", ["java.util.ArrayList", "long", "boolean", "boolean", "boolean", "int", "o"]
+                "sendMessage",
+                [_t("java.util.ArrayList"), _t("long"), _t("boolean"),
+                 _t("boolean"), _t("boolean"), _t("int"), _t("o")],
             )
         elif name == "org.telegram.tgnet.RequestCallback":
             pass

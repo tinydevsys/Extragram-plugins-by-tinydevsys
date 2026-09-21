@@ -711,6 +711,23 @@ def test_update_send_as_avatar():
     check("visible", ev.senderSelectView.visible == S.JView.VISIBLE)
 
 
+def test_diag():
+    print("[diag]")
+    p = make_plugin()
+    setup_accounts()
+    check("hooks tracked", p._hooks_ok == p._hooks_total == 4, str(p._diag_log))
+    check("diag log nonempty", len(p._diag_log) >= 4)
+    p._warn_once("k1", "тестовая ошибка")
+    n1 = len(BulletinHelper.SHOWN)
+    p._warn_once("k1", "тестовая ошибка 2")
+    check("warn once", len(BulletinHelper.SHOWN) == n1)
+    AlertDialogBuilder.SHOWN = []
+    p._show_diag()
+    check("diag dialog shown", len(AlertDialogBuilder.SHOWN) == 1)
+    if AlertDialogBuilder.SHOWN:
+        check("diag dialog content", "Хуки" in AlertDialogBuilder.SHOWN[0].message)
+
+
 def main():
     test_metadata()
     test_status()
@@ -726,6 +743,7 @@ def main():
     test_settings()
     test_sender_view_wrap()
     test_update_send_as_avatar()
+    test_diag()
 
     print()
     print("PASS: {}  FAIL: {}".format(len(PASS), len(FAIL)))

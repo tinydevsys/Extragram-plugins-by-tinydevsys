@@ -23,6 +23,7 @@ Send as Accounts — плагин для exteraGram.
 """
 
 import threading
+import time
 import traceback
 from typing import Any, List
 
@@ -334,29 +335,67 @@ class SendAsAccountsPlugin(BasePlugin):
         self._last_redirect = None
         self._pending_popup_peer = None
         self._tls = threading.local()
+        self._hooks_ok = 0
+        self._hooks_total = 4
+        self._warned = set()
+        self._diag_log = []
 
         try:
             self.menu_item_id = self._add_menu_item()
         except Exception:
             log(traceback.format_exc())
+            self._diag("menu item: " + traceback.format_exc().strip().splitlines()[-1])
             self.menu_item_id = None
 
         self._hook_popup()
         self._hook_sender_view()
         self._hook_update_send_as()
         self._hook_send()
-        self.log("Send as Accounts: loaded")
+        self.log(
+            "Send as Accounts: loaded, hooks {}/{}".format(self._hooks_ok, self._hooks_total)
+        )
+        self._diag(
+            "loaded: hooks {}/{} accounts={}".format(
+                self._hooks_ok,
+                self._hooks_total,
+                len([a for a in range(UserConfig.MAX_ACCOUNT_COUNT) if UserConfig.isValidAccount(a)]),
+            )
+        )
 
     def on_plugin_unload(self):
         STATE_REGISTRY.clear()
         self.log("Send as Accounts: unloaded")
 
     # ------------------------------------------------------------------
+    # Диагностика (видимая пользователю)
+    # ------------------------------------------------------------------
+
+    def _diag(self, msg):
+        try:
+            self._diag_log.append(
+                "{} {}".format(time.strftime("%H:%M:%S"), str(msg)[:300])
+            )
+            if len(self._diag_log) > 25:
+                self._diag_log = self._diag_log[-25:]
+        except Exception:
+            pass
+
+    def _warn_once(self, key, text):
+        """Bulletin об ошибке — не чаще раза за сессию на каждый key."""
+        try:
+            if key in self._warned:
+                return
+            self._warned.add(key)
+            run_on_ui_thread(lambda: BulletinHelper.show_error(text))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # Регистрация хуков
     # ------------------------------------------------------------------
 
     def _add_menu_item(self):
-        return self.add_menu_item(
+        menu_id = self.add_menu_item(
             MenuItemData(
                 menu_type=MenuItemType.CHAT_ACTION_MENU,
                 text="Отправлять от…",
@@ -366,12 +405,24 @@ class SendAsAccountsPlugin(BasePlugin):
                 on_click=self._on_chat_action_menu,
             )
         )
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="Send as Accounts: диагностика",
+                icon="msg_settings",
+                subtext="Состояние плагина",
+                priority=1,
+                on_click=lambda _ctx: self._show_diag(),
+            )
+        )
+        return menu_id
 
     def _hook_popup(self):
         try:
             cls = find_class("org.telegram.ui.Components.SenderSelectPopup")
             if cls is None:
                 self.log("Send as Accounts: SenderSelectPopup class not found")
+                self._diag("popup hook: SenderSelectPopup class not found")
                 return
             ctor = cls.getDeclaredConstructor(
                 find_class("android.content.Context"),
@@ -383,37 +434,50 @@ class SendAsAccountsPlugin(BasePlugin):
             )
             ctor.setAccessible(True)
             self.hook_method(ctor, PopupCtorHook(self))
+            self._hooks_ok += 1
+            self._diag("popup hook: ok")
         except Exception:
             log(traceback.format_exc())
+            self._diag("popup hook: " + traceback.format_exc().strip().splitlines()[-1])
 
     def _hook_sender_view(self):
         try:
             cls = find_class("org.telegram.ui.Components.ChatActivityEnterView")
             if cls is None:
+                self._diag("sender_view hook: class not found")
                 return
             m = cls.getDeclaredMethod("createSenderSelectView")
             m.setAccessible(True)
             self.hook_method(m, SenderViewCreateHook(self))
+            self._hooks_ok += 1
+            self._diag("sender_view hook: ok")
         except Exception:
             log(traceback.format_exc())
+            self._diag("sender_view hook: " + traceback.format_exc().strip().splitlines()[-1])
 
     def _hook_update_send_as(self):
         try:
             cls = find_class("org.telegram.ui.Components.ChatActivityEnterView")
             if cls is None:
+                self._diag("update_send_as hook: class not found")
                 return
             m = cls.getDeclaredMethod("updateSendAsButton", JBoolean.TYPE)
             m.setAccessible(True)
             self.hook_method(m, UpdateSendAsHook(self))
+            self._hooks_ok += 1
+            self._diag("update_send_as hook: ok")
         except Exception:
             log(traceback.format_exc())
+            self._diag("update_send_as hook: " + traceback.format_exc().strip().splitlines()[-1])
 
     def _hook_send(self):
         try:
             cls = find_class("org.telegram.messenger.SendMessagesHelper")
             if cls is None:
                 self.log("Send as Accounts: SendMessagesHelper class not found")
+                self._diag("send hook: SendMessagesHelper class not found")
                 return
+            hooked = 0
             for m in cls.getDeclaredMethods():
                 if m.getName() != "sendMessage":
                     continue
@@ -422,12 +486,20 @@ class SendAsAccountsPlugin(BasePlugin):
                     # Основной путь отправки (текст/медиа/файлы/опросы).
                     m.setAccessible(True)
                     self.hook_method(m, SendRedirectHook(self))
+                    hooked += 1
                 elif len(params) == 7 and params[1].getName() == "long":
                     # Пересылка сообщений.
                     m.setAccessible(True)
                     self.hook_method(m, SendRedirectHook(self))
+                    hooked += 1
+            if hooked:
+                self._hooks_ok += 1
+                self._diag("send hook: ok ({} methods)".format(hooked))
+            else:
+                self._diag("send hook: no sendMessage overloads found")
         except Exception:
             log(traceback.format_exc())
+            self._diag("send hook: " + traceback.format_exc().strip().splitlines()[-1])
 
     # ------------------------------------------------------------------
     # Состояние и настройки
@@ -586,6 +658,62 @@ class SendAsAccountsPlugin(BasePlugin):
                 return
             self._remember_channels(popup)
             self._inject_accounts(popup, peer)
+        except Exception:
+            log(traceback.format_exc())
+            self._diag("popup inject error: " + traceback.format_exc().strip().splitlines()[-1])
+            self._warn_once("popup", "Send as Accounts: не удалось добавить аккаунты в список (см. диагностику)")
+
+    # ------------------------------------------------------------------
+    # Диагностика
+    # ------------------------------------------------------------------
+
+    def _show_diag(self):
+        try:
+            accounts = [
+                a for a in range(UserConfig.MAX_ACCOUNT_COUNT)
+                if UserConfig.isValidAccount(a)
+            ]
+            lines = [
+                "Аккаунтов в приложении: {} (текущий: {})".format(
+                    len(accounts), UserConfig.selectedAccount
+                ),
+                "Режим: {}".format(MODE_NAMES[self.get_setting("switch_mode", MODE_HYBRID)]),
+                "Хуки зарегистрированы: {}/{}".format(
+                    getattr(self, "_hooks_ok", 0), getattr(self, "_hooks_total", 4)
+                ),
+                "Запомненных отправителей: {}".format(
+                    len(self._sender_map())
+                ),
+                "",
+                "События:",
+            ]
+            for entry in list(getattr(self, "_diag_log", []))[-12:]:
+                lines.append(entry)
+            text = "\n".join(lines)
+
+            def _run():
+                try:
+                    fragment = get_last_fragment()
+                    activity = fragment.getParentActivity() if fragment else None
+                    if activity is None:
+                        self._info("Не удалось открыть диагностику")
+                        return
+                    builder = AlertDialogBuilder(activity)
+                    builder.set_title("Send as Accounts — диагностика")
+                    builder.set_message(text)
+
+                    def _ok(bld, which):
+                        try:
+                            bld.dismiss()
+                        except Exception:
+                            pass
+
+                    builder.set_positive_button("ОК", _ok)
+                    builder.show()
+                except Exception:
+                    log(traceback.format_exc())
+
+            run_on_ui_thread(_run)
         except Exception:
             log(traceback.format_exc())
 
