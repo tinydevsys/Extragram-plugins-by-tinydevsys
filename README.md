@@ -15,7 +15,8 @@
 восемь настроек (режимы смены, скрытие, порядок, уведомления,
 запоминание отправителя на чат).
 
-- Плагин: [`send_as_accounts/send_as_accounts.py`](send_as_accounts/send_as_accounts.py)
+- Плагин (исходник): [`send_as_accounts/send_as_accounts.py`](send_as_accounts/send_as_accounts.py)
+- Для установки: [`send_as_accounts/send_as_accounts.plugin`](send_as_accounts/send_as_accounts.plugin) (тот же файл — отправить себе в Telegram и тапнуть)
 - Документация: [`send_as_accounts/README.md`](send_as_accounts/README.md)
 - Иконка: [`send_as_accounts/icon.png`](send_as_accounts/icon.png) (128×128)
 

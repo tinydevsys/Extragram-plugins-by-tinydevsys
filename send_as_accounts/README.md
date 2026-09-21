@@ -65,9 +65,27 @@ Telegram-сервер не принимает «send as» для чужих ли
 
 ## Установка
 
-Плагин — один файл `send_as_accounts.py` (формат exteraGram, `__id__ =
-"send_as_accounts"`). Установка как для любого плагина exteraGram:
-DevServer (порт 42690), sideload или через каталог плагинов.
+Плагин — одиночный Python-файл (`__id__ = "send_as_accounts"`).
+Формат дистрибутива exteraGram — **`.plugin`**: это тот же самый
+Python-файл, только переименованный (проверено по публичным плагинам,
+например Message-Repeater-Pro и Auto-Forwarder-Plugin).
+
+Вариант 1 — «тапнуть в Telegram» (рекомендуется):
+
+1. Скачать `send_as_accounts.plugin` из репозитория (или переименовать
+   `send_as_accounts.py` в `send_as_accounts.plugin` — содержимое
+   идентичное).
+2. Отправить файл себе в Telegram (например, в «Избранное»).
+3. Тапнуть на файл внутри exteraGram — появится диалог
+   **INSTALL PLUGIN** — подтвердить.
+4. Включить плагин: `Настройки exteraGram → Плагины`.
+
+Вариант 2 — DevServer (разработка): через `adb forward tcp:42690
+tcp:42690` отправить команду `write_plugin` с содержимым
+`send_as_accounts.py` (порт по умолчанию 42690, см. доки SDK).
+
+После установки файл лежит на устройстве как
+`/data/user/0/com.exteragram.messenger/files/plugins/send_as_accounts.py`.
 
 ## Настройки
 
@@ -130,6 +148,7 @@ boxed-типы, retry, секретные чаты), валидация цели
 
 Файлы:
 
-- `send_as_accounts.py` — плагин (единственный файл, устанавливаемый в приложение);
+- `send_as_accounts.py` — плагин (исходник, формат для DevServer/разработки);
+- `send_as_accounts.plugin` — тот же файл для установки «тапом в Telegram»;
 - `tests/stubs.py` — заглушки экосистемы exteraGram/Java/Android для десктоп-тестов;
 - `tests/test_logic.py` — набор тестов (не требуется для установки плагина).
