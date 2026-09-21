@@ -83,7 +83,7 @@ __description__ = (
     "смена аккаунта."
 )
 __author__ = "tinydevsys"
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -183,6 +183,82 @@ def _exc_info(exc):
             return type(exc).__name__
         except Exception:
             return "error"
+
+
+def _field_by_type(obj, type_name):
+    """Поиск поля объекта по типу Java-класса (запасной путь, если имя
+    поля в этой версии клиента другое)."""
+    try:
+        short = type_name.rsplit(".", 1)[-1]
+        cls = obj.getClass()
+        while cls is not None:
+            for f in cls.getDeclaredFields():
+                try:
+                    fname = f.getName()
+                    ftype = f.getType().getName()
+                    if ftype == type_name or ftype.rsplit(".", 1)[-1] == short:
+                        f.setAccessible(True)
+                        v = f.get(obj)
+                        if v is not None:
+                            return v
+                except Exception:
+                    continue
+            cls = cls.getSuperclass()
+    except Exception:
+        pass
+    return None
+
+
+def _find_sender_view(enter_view):
+    """Кнопка-аватар: поле senderSelectView или поиск по классу
+    SenderSelectView среди потомков (имя поля может отличаться)."""
+    view = get_private_field(enter_view, "senderSelectView")
+    if view is not None:
+        return view
+    try:
+        cls = JClass.forName("org.telegram.ui.Components.SenderSelectView")
+        from android.view import ViewGroup as JViewGroup
+
+        stack = [enter_view]
+        seen = 0
+        while stack and seen < 200:
+            parent = stack.pop()
+            seen += 1
+            try:
+                n = parent.getChildCount()
+            except Exception:
+                continue
+            for i in range(n):
+                try:
+                    child = parent.getChildAt(i)
+                except Exception:
+                    continue
+                if child is None:
+                    continue
+                if cls.isInstance(child):
+                    return child
+                if isinstance(child, JViewGroup):
+                    stack.append(child)
+    except Exception:
+        pass
+    return None
+
+
+def _enter_view_dialog_id(enter_view):
+    """id диалога входного поля: поле dialog_id или текущий фрагмент."""
+    try:
+        d = get_private_field(enter_view, "dialog_id")
+        if d is not None:
+            return int(d)
+    except Exception:
+        pass
+    try:
+        frag = get_last_fragment()
+        if frag is not None and "ChatActivity" in frag.getClass().getName():
+            return int(frag.getDialogId())
+    except Exception:
+        pass
+    return None
 
 
 
@@ -452,6 +528,16 @@ class SendAsAccountsPlugin(BasePlugin):
             return
         probe_last[name] = time.time()
         self._diag("{} fired".format(name))
+
+    def _diag_once(self, name, text):
+        """Строка в диагностику один раз за сессию (не спамить)."""
+        done = getattr(self, "_diag_once_set", None)
+        if done is None:
+            done = self._diag_once_set = set()
+        if name in done:
+            return
+        done.add(name)
+        self._diag(text)
 
     def _diag(self, msg):
         try:
@@ -963,9 +1049,13 @@ class SendAsAccountsPlugin(BasePlugin):
         try:
             recycler = get_private_field(popup, "recyclerView")
             if recycler is None:
-                return
+                recycler = _field_by_type(popup, "androidx.recyclerview.widget.RecyclerView")
+                if recycler is None:
+                    self._diag("inject: recyclerView не найден")
+                    return
             orig_adapter = recycler.getAdapter()
             orig_total = orig_adapter.getItemCount() if orig_adapter is not None else 0
+            self._diag("inject: popup peer={} orig_rows={}".format(peer, orig_total))
 
             orig_positions = []
             if not self.get_setting("hide_channels", False):
@@ -1015,8 +1105,14 @@ class SendAsAccountsPlugin(BasePlugin):
             long_click = LongClickProxy.new_instance()
             long_click.token = token
             recycler.setOnItemLongClickListener(long_click.java)
-        except Exception:
+            self._diag(
+                "accounts injected: {} acc + {} ch (peer {})".format(
+                    len(accounts), len(orig_positions), peer
+                )
+            )
+        except Exception as e:
             log(traceback.format_exc())
+            self._diag("inject error: " + _exc_info(e))
 
     def _bind_account_row(self, view, acc, peer):
         try:
@@ -1184,18 +1280,28 @@ class SendAsAccountsPlugin(BasePlugin):
     def _on_sender_view_created(self, param):
         try:
             self._probe("createSenderSelectView")
-            enter_view = param.thisObject
-            view = get_private_field(enter_view, "senderSelectView")
-            if view is None or view.getTag() == VIEW_TAG_WRAPPED:
+            self._ensure_sender_wrapped(param.thisObject)
+        except Exception:
+            log(traceback.format_exc())
+
+    def _ensure_sender_wrapped(self, enter_view):
+        """Ставим свой обработчик клика по кнопке-аватару (идемпоотно)."""
+        try:
+            view = _find_sender_view(enter_view)
+            if view is None:
+                self._diag_once("wrap_no_view", "sender view: кнопка не найдена")
+                return
+            if view.getTag() == VIEW_TAG_WRAPPED:
                 return
             orig = view.getOnClickListener()
             if orig is None:
+                self._diag_once("wrap_no_listener", "sender view: нет обработчика клика")
                 return
-            view.setTag(VIEW_TAG_WRAPPED)
+            plugin = self
 
             def handler(v):
                 try:
-                    dialog_id = get_private_field(enter_view, "dialog_id")
+                    dialog_id = _enter_view_dialog_id(enter_view)
                     if dialog_id is None or _is_encrypted(dialog_id):
                         return
                     send_as = None
@@ -1205,12 +1311,12 @@ class SendAsAccountsPlugin(BasePlugin):
                             send_as = delegate.getSendAsPeers()
                     except Exception:
                         send_as = None
-                    self._diag(
+                    plugin._diag(
                         "avatar clicked: dialog={} channels={}".format(
                             dialog_id, "yes" if send_as is not None else "no"
                         )
                     )
-                    if not self._get_accounts_for_list():
+                    if not plugin._get_accounts_for_list():
                         # Других аккаунтов нет — оригинальное поведение.
                         try:
                             orig.onClick(v)
@@ -1219,7 +1325,7 @@ class SendAsAccountsPlugin(BasePlugin):
                         return
                     # Всегда открываем собственный попап (аккаунты + каналы):
                     # он не зависит от хука на конструктор SenderSelectPopup.
-                    if not self._show_own_popup(v, enter_view, dialog_id, send_as):
+                    if not plugin._show_own_popup(v, enter_view, dialog_id, send_as):
                         if send_as is not None:
                             try:
                                 orig.onClick(v)
@@ -1229,8 +1335,11 @@ class SendAsAccountsPlugin(BasePlugin):
                     log(traceback.format_exc())
 
             view.setOnClickListener(OnClickListener(handler))
-        except Exception:
+            view.setTag(VIEW_TAG_WRAPPED)
+            self._diag("sender view wrapped")
+        except Exception as e:
             log(traceback.format_exc())
+            self._diag_once("wrap_error", "sender view wrap error: " + _exc_info(e))
 
     # ------------------------------------------------------------------
     # Показ аватара выбранного аккаунта в поле ввода
@@ -1240,7 +1349,8 @@ class SendAsAccountsPlugin(BasePlugin):
         try:
             self._probe("updateSendAsButton")
             enter_view = param.thisObject
-            peer = get_private_field(enter_view, "dialog_id")
+            self._ensure_sender_wrapped(enter_view)
+            peer = _enter_view_dialog_id(enter_view)
             if peer is None or _is_encrypted(peer):
                 return
             acc = self.get_sender_account(peer)

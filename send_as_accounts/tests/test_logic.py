@@ -141,7 +141,7 @@ def test_metadata():
                     pass
     check("id", consts.get("__id__") == "send_as_accounts")
     check("name", bool(consts.get("__name__")))
-    check("version", consts.get("__version__") == "1.0.4")
+    check("version", consts.get("__version__") == "1.0.5")
     check("app_version", "12.5.1" in consts.get("__app_version__", ""))
     check("sdk_version", "1.4.4.3" in consts.get("__sdk_version__", ""))
     check("icon", consts.get("__icon__", "").startswith("exteraPlugins"))
@@ -839,6 +839,16 @@ def test_sender_view_wrap():
     before = ev.senderSelectView._wrapped
     p._on_sender_view_created(param)
     check("not double wrapped", ev.senderSelectView._wrapped is before)
+
+    # Обёртка ставится и из updateSendAsButton, даже если отправитель
+    # ещё не выбран.
+    ev2 = FakeEnterView()
+    ev2.senderSelectView = FakeView()
+    p._on_update_send_as_after(FakeParam(this_object=ev2))
+    check(
+        "wrap via updateSendAsButton",
+        ev2.senderSelectView._wrapped is not None,
+    )
 
     tracker = {"created": 0}
     orig_show = p._show_own_popup
