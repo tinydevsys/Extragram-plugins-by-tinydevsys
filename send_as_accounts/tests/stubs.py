@@ -28,6 +28,14 @@ def _mod(name):
 java = _mod("java")
 java.jarray = lambda sig, values: list(values)
 
+
+def _jclass_stub(name):
+    # Лениво: default_find_class определяется ниже.
+    return default_find_class(name)
+
+
+java.jclass = _jclass_stub
+
 java_lang = _mod("java.lang")
 java.lang = java_lang
 

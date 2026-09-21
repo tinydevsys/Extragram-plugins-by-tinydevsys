@@ -42,7 +42,7 @@ from ui.settings import Divider, Header, Input, Selector, Switch, Text
 
 from extera_utils.classes import Base, java_subclass, jfield, joverride
 
-from java import jarray
+from java import jarray, jclass
 from java.lang import Boolean as JBoolean
 from java.lang import Integer as JInteger
 from java.lang import Long as JLong
@@ -135,6 +135,19 @@ def _is_banned(chat):
     except Exception:
         pass
     return False
+
+
+def _jclass(name):
+    """Объект java.lang.Class для рефлексии (getDeclaredMethod и т.п.).
+
+    ВАЖНО: в этой версии SDK find_class возвращает Python-type обёртку,
+    у которой НЕТ методов рефлексии — только jclass даёт настоящий
+    объект java.lang.Class.
+    """
+    try:
+        return jclass(name)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -419,18 +432,18 @@ class SendAsAccountsPlugin(BasePlugin):
 
     def _hook_popup(self):
         try:
-            cls = find_class("org.telegram.ui.Components.SenderSelectPopup")
+            cls = _jclass("org.telegram.ui.Components.SenderSelectPopup")
             if cls is None:
                 self.log("Send as Accounts: SenderSelectPopup class not found")
                 self._diag("popup hook: SenderSelectPopup class not found")
                 return
             ctor = cls.getDeclaredConstructor(
-                find_class("android.content.Context"),
-                find_class("org.telegram.ui.ChatActivity"),
-                find_class("org.telegram.messenger.MessagesController"),
-                find_class("org.telegram.tgnet.TLRPC$ChatFull"),
-                find_class("org.telegram.tgnet.TLRPC$TL_channels_sendAsPeers"),
-                find_class("org.telegram.ui.Components.SenderSelectPopup$OnSelectCallback"),
+                _jclass("android.content.Context"),
+                _jclass("org.telegram.ui.ChatActivity"),
+                _jclass("org.telegram.messenger.MessagesController"),
+                _jclass("org.telegram.tgnet.TLRPC$ChatFull"),
+                _jclass("org.telegram.tgnet.TLRPC$TL_channels_sendAsPeers"),
+                _jclass("org.telegram.ui.Components.SenderSelectPopup$OnSelectCallback"),
             )
             ctor.setAccessible(True)
             self.hook_method(ctor, PopupCtorHook(self))
@@ -442,7 +455,7 @@ class SendAsAccountsPlugin(BasePlugin):
 
     def _hook_sender_view(self):
         try:
-            cls = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            cls = _jclass("org.telegram.ui.Components.ChatActivityEnterView")
             if cls is None:
                 self._diag("sender_view hook: class not found")
                 return
@@ -457,7 +470,7 @@ class SendAsAccountsPlugin(BasePlugin):
 
     def _hook_update_send_as(self):
         try:
-            cls = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            cls = _jclass("org.telegram.ui.Components.ChatActivityEnterView")
             if cls is None:
                 self._diag("update_send_as hook: class not found")
                 return
@@ -472,7 +485,7 @@ class SendAsAccountsPlugin(BasePlugin):
 
     def _hook_send(self):
         try:
-            cls = find_class("org.telegram.messenger.SendMessagesHelper")
+            cls = _jclass("org.telegram.messenger.SendMessagesHelper")
             if cls is None:
                 self.log("Send as Accounts: SendMessagesHelper class not found")
                 self._diag("send hook: SendMessagesHelper class not found")
