@@ -926,6 +926,7 @@ class _MessagesController:
         self.account = account
         self.chats = {}
         self.full_chats = {}
+        self.default_send_as_calls = []
 
     @classmethod
     def getInstance(cls, num):
@@ -956,7 +957,7 @@ class _MessagesController:
         pass
 
     def setDefaultSendAs(self, chat_id, new_peer):
-        pass
+        self.default_send_as_calls.append((chat_id, new_peer))
 
     @classmethod
     def getNotificationsSettings(cls, *a, **k):
@@ -1295,6 +1296,7 @@ class SenderSelectPopup:
         self.recyclerView._click = _OrigClick(self)
         self._dismissed = False
         SenderSelectPopup.LAST = self
+        self._shown = False
         # Имитация Xposed-хука на конструктор.
         ctor_args = (
             context,
@@ -1308,6 +1310,24 @@ class SenderSelectPopup:
         )
         for h in list(POPUP_CTOR_HOOKS):
             h.after_hooked_method(_CtorParam(self, ctor_args))
+
+    def setOutsideTouchable(self, v):
+        pass
+
+    def setFocusable(self, v):
+        pass
+
+    def setAnimationEnabled(self, v):
+        pass
+
+    def getContentView(self):
+        return _PopupContent()
+
+    def showAtLocation(self, anchor, gravity, x, y):
+        self._shown = True
+
+    def dismiss(self):
+        self._dismissed = True
 
 
 class _CtorParam:

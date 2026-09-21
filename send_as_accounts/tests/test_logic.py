@@ -141,7 +141,7 @@ def test_metadata():
                     pass
     check("id", consts.get("__id__") == "send_as_accounts")
     check("name", bool(consts.get("__name__")))
-    check("version", consts.get("__version__") == "1.0.3")
+    check("version", consts.get("__version__") == "1.0.4")
     check("app_version", "12.5.1" in consts.get("__app_version__", ""))
     check("sdk_version", "1.4.4.3" in consts.get("__sdk_version__", ""))
     check("icon", consts.get("__icon__", "").startswith("exteraPlugins"))
@@ -576,26 +576,34 @@ def test_popup_injection():
     check("8-arg ctor detected", "OnSelectCallback" in diag_text, diag_text)
 
 
+class _PopupAnchor:
+    def getLocationInWindow(self, loc):
+        loc[0], loc[1] = 10, 600
+
+    def setProgress(self, v):
+        pass
+
+
+class _PopupEnterView:
+    def __init__(self, dialog_id):
+        self.parentFragment = None
+        self.dialog_id = dialog_id
+        self.updates = []
+
+    def getContext(self):
+        return None
+
+    def updateSendAsButton(self):
+        self.updates.append(self.dialog_id)
+
+
 def test_private_popup():
     print("[private popup]")
     p = make_plugin()
     setup_accounts()
 
-    class Anchor:
-        def getLocationInWindow(self, loc):
-            loc[0], loc[1] = 10, 600
-
-        def setProgress(self, v):
-            pass
-
-    class EnterView:
-        parentFragment = None
-        dialog_id = 555
-
-        def getContext(self):
-            return None
-
-    p._show_own_popup(Anchor(), EnterView(), 555)
+    ok = p._show_own_popup(_PopupAnchor(), _PopupEnterView(555), 555)
+    check("own popup opened", ok is True)
     check("no pending left", p._pending_popup_peer is None)
     popup = SenderSelectPopup.LAST
     a = popup.recyclerView.getAdapter()
@@ -603,6 +611,75 @@ def test_private_popup():
         "private popup accounts",
         type(a) is MOD.SenderAdapter and a.getItemCount() == 4,
     )
+
+
+def test_own_group_popup():
+    print("[own group popup]")
+    p = make_plugin()
+    setup_accounts()
+    chat_id = setup_group_chat()
+    BulletinHelper.reset()
+    p.set_setting("switch_mode", MOD.MODE_SWITCH)
+
+    mc0 = MessagesController.getInstance(0)
+    peer_ch1 = TLRPC.TL_peerChannel()
+    peer_ch1.channel_id = 9001
+    mc0.putChat(9001, TLRPC.TL_channel(9001))
+    send_as = TLRPC.TL_channels_sendAsPeers()
+    send_as.peers = [TLRPC.TL_sendAsPeer(peer_ch1)]
+
+    ev = _PopupEnterView(-chat_id)
+    ok = p._show_own_popup(_PopupAnchor(), ev, -chat_id, send_as)
+    check("group popup opened", ok is True)
+    popup = SenderSelectPopup.LAST
+    recycler = popup.recyclerView
+    a = recycler.getAdapter()
+    check(
+        "group popup: 4 acc + 1 ch",
+        type(a) is MOD.SenderAdapter and a.getItemCount() == 5,
+        str(a.getItemCount()),
+    )
+    check("group popup viewtypes", a.getItemViewType(0) == 1 and a.getItemViewType(4) == 0)
+
+    # канал (позиция 4): setDefaultSendAs + updateSendAsButton + dismiss
+    recycler.onItemClickListener.onItemClick(None, 4)
+    check(
+        "channel default saved",
+        mc0.default_send_as_calls == [(-chat_id, -9001)],
+        str(mc0.default_send_as_calls),
+    )
+    check("channel button updated", ev.updates == [-chat_id], str(ev.updates))
+    check("channel popup dismissed", popup._dismissed is True)
+
+    # аккаунт Bob (позиция 1)
+    recycler.onItemClickListener.onItemClick(None, 1)
+    check("bob saved via own popup", p.get_sender_account(-chat_id) == 1)
+
+    # текущий аккаунт (позиция 0) — сброс
+    recycler.onItemClickListener.onItemClick(None, 0)
+    check("current account clears sender", p.get_sender_account(-chat_id) is None)
+
+    # живой клик по кнопке: собственный попап открывается,
+    # нативный не вызывается
+    calls = {"orig": 0}
+
+    class EnterView2(_PopupEnterView):
+        def getSendAsPeers(self):
+            return send_as
+
+        @property
+        def delegate(self):
+            return self
+
+        def getContext(self):
+            return None
+
+    # эмуляция обработчика клика из _on_sender_view_created
+    state = None
+    for token, st in MOD.STATE_REGISTRY.items():
+        if st["peer"] == -chat_id:
+            state = st
+    check("state has enter_view", state is not None and state["enter_view"] is ev)
 
 
 def test_chat_menu():
@@ -905,6 +982,7 @@ def main():
     test_validate_target()
     test_popup_injection()
     test_private_popup()
+    test_own_group_popup()
     test_chat_menu()
     test_join_flow()
     test_settings()

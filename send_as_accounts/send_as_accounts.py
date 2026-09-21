@@ -83,7 +83,7 @@ __description__ = (
     "смена аккаунта."
 )
 __author__ = "tinydevsys"
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -185,6 +185,7 @@ def _exc_info(exc):
             return "error"
 
 
+
 # ---------------------------------------------------------------------------
 # Java-прокси (создаются DexMaker'ом в runtime)
 # ---------------------------------------------------------------------------
@@ -278,8 +279,12 @@ class ClickProxy(Base):
                 # Сначала сбрасываем сохранённого аккаунта, чтобы оригинальный
                 # поток (updateSendAsButton) уже не подменял аватар обратно.
                 plugin._on_original_peer_selected(st["peer"])
-                if st["orig_listener"] is not None:
-                    st["orig_listener"].onItemClick(view, st["orig_positions"][position - n_acc])
+                orig_pos = st["orig_positions"][position - n_acc]
+                if st.get("enter_view") is not None:
+                    # Собственный попап: повторяем действия оригинала.
+                    plugin._on_own_channel_selected(st, orig_pos)
+                elif st["orig_listener"] is not None:
+                    st["orig_listener"].onItemClick(view, orig_pos)
         except Exception:
             log(traceback.format_exc())
 
@@ -438,6 +443,15 @@ class SendAsAccountsPlugin(BasePlugin):
     # ------------------------------------------------------------------
     # Диагностика (видимая пользователю)
     # ------------------------------------------------------------------
+
+    def _probe(self, name, interval=60):
+        probe_last = getattr(self, "_probe_last", None)
+        if probe_last is None:
+            probe_last = self._probe_last = {}
+        if time.time() - probe_last.get(name, 0) < interval:
+            return
+        probe_last[name] = time.time()
+        self._diag("{} fired".format(name))
 
     def _diag(self, msg):
         try:
@@ -785,8 +799,13 @@ class SendAsAccountsPlugin(BasePlugin):
                 return
             self._diag("popup created: peer={}".format(peer))
             self._remember_channels(popup)
+            own_enter_view = getattr(self, "_pending_own_enter_view", None)
+            self._pending_own_enter_view = None
             self._inject_accounts(
-                popup, peer, self._resources_provider_from_args(self._ctor_args(param))
+                popup,
+                peer,
+                self._resources_provider_from_args(self._ctor_args(param)),
+                own_enter_view,
             )
         except Exception as e:
             log(traceback.format_exc())
@@ -940,7 +959,7 @@ class SendAsAccountsPlugin(BasePlugin):
         except Exception:
             log(traceback.format_exc())
 
-    def _inject_accounts(self, popup, peer, resources_provider=None):
+    def _inject_accounts(self, popup, peer, resources_provider=None, enter_view=None):
         try:
             recycler = get_private_field(popup, "recyclerView")
             if recycler is None:
@@ -980,6 +999,8 @@ class SendAsAccountsPlugin(BasePlugin):
                 "popup": popup,
                 "orig_listener": get_private_field(recycler, "onItemClickListener"),
                 "resources_provider": resources_provider,
+                "enter_view": enter_view,
+                "send_as": get_private_field(popup, "sendAsPeers"),
             }
             token = self._register_state(state)
 
@@ -1024,6 +1045,43 @@ class SendAsAccountsPlugin(BasePlugin):
         """Пользователь выбрал канал — сбрасываем сохранённого аккаунта."""
         self._clear_sender(peer)
 
+    def _on_own_channel_selected(self, st, orig_pos):
+        """Выбор канала в собственном попапе: повторяем действия
+        оригинального обработчика (память «отправить от» + кнопка)."""
+        try:
+            send_as = st.get("send_as")
+            peer_obj = None
+            if send_as is not None:
+                peers = getattr(send_as, "peers", None) or []
+                if orig_pos < len(peers):
+                    peer_obj = peers[orig_pos].peer
+            if peer_obj is not None:
+                peer_id = 0
+                if peer_obj.channel_id != 0:
+                    peer_id = -peer_obj.channel_id
+                elif peer_obj.user_id != 0:
+                    peer_id = peer_obj.user_id
+                if peer_id != 0:
+                    try:
+                        MessagesController.getInstance(
+                            UserConfig.selectedAccount
+                        ).setDefaultSendAs(int(st["peer"]), peer_id)
+                    except Exception:
+                        pass
+            enter_view = st.get("enter_view")
+            if enter_view is not None:
+                try:
+                    enter_view.updateSendAsButton()
+                except Exception:
+                    pass
+            if st.get("popup") is not None:
+                try:
+                    st["popup"].dismiss()
+                except Exception:
+                    pass
+        except Exception:
+            log(traceback.format_exc())
+
     def _on_account_row_tapped(self, peer, acc, popup, view):
         try:
             if popup is not None:
@@ -1053,26 +1111,43 @@ class SendAsAccountsPlugin(BasePlugin):
         except Exception:
             log(traceback.format_exc())
 
-    def _show_own_popup(self, anchor_view, enter_view, dialog_id):
-        """Собственный попап для чатов, где нет «отправить от канала» (ЛС, боты)."""
+    def _show_own_popup(self, anchor_view, enter_view, dialog_id, send_as=None):
+        """Собственный попап: аккаунты + каналы (если в чате есть
+        «отправить от канала»). В отличие от нативного, не зависит от
+        хука на конструктор SenderSelectPopup — конструктор вызываем
+        сами. Возвращает True, если окно открылось."""
         try:
             context = enter_view.getContext()
             parent_fragment = get_private_field(enter_view, "parentFragment")
             controller = MessagesController.getInstance(UserConfig.selectedAccount)
-            empty = TLRPC.TL_channels_sendAsPeers()
-
+            if send_as is None:
+                send_as = TLRPC.TL_channels_sendAsPeers()
+            n_ch = 0
+            try:
+                if getattr(send_as, "peers", None):
+                    n_ch = len(send_as.peers)
+            except Exception:
+                pass
             resources_provider = get_private_field(enter_view, "resourcesProvider")
             self._pending_popup_peer = dialog_id
-            popup = SenderSelectPopup(
-                *self._build_popup_args(
-                    context,
-                    parent_fragment,
-                    controller,
-                    empty,
-                    SelectCallbackProxy.new_instance(),
-                    resources_provider,
+            self._pending_own_enter_view = enter_view
+            try:
+                popup = SenderSelectPopup(
+                    *self._build_popup_args(
+                        context,
+                        parent_fragment,
+                        controller,
+                        send_as,
+                        SelectCallbackProxy.new_instance(),
+                        resources_provider,
+                    )
                 )
-            )
+            except Exception as e:
+                self._pending_popup_peer = None
+                self._pending_own_enter_view = None
+                log(traceback.format_exc())
+                self._diag("own popup ctor failed: " + _exc_info(e))
+                return False
             popup.setOutsideTouchable(True)
             popup.setFocusable(True)
             popup.setAnimationEnabled(False)
@@ -1093,9 +1168,14 @@ class SendAsAccountsPlugin(BasePlugin):
                 anchor_view.setProgress(1)
             except Exception:
                 pass
-        except Exception:
-            log(traceback.format_exc())
+            self._diag("own popup opened: dialog={} channels={}".format(dialog_id, n_ch))
+            return True
+        except Exception as e:
             self._pending_popup_peer = None
+            self._pending_own_enter_view = None
+            log(traceback.format_exc())
+            self._diag("own popup error: " + _exc_info(e))
+            return False
 
     # ------------------------------------------------------------------
     # Обработчик кнопки-аватара (вводное поле)
@@ -1103,6 +1183,7 @@ class SendAsAccountsPlugin(BasePlugin):
 
     def _on_sender_view_created(self, param):
         try:
+            self._probe("createSenderSelectView")
             enter_view = param.thisObject
             view = get_private_field(enter_view, "senderSelectView")
             if view is None or view.getTag() == VIEW_TAG_WRAPPED:
@@ -1115,19 +1196,37 @@ class SendAsAccountsPlugin(BasePlugin):
             def handler(v):
                 try:
                     dialog_id = get_private_field(enter_view, "dialog_id")
-                    if _is_encrypted(dialog_id):
+                    if dialog_id is None or _is_encrypted(dialog_id):
                         return
-                    delegate = get_private_field(enter_view, "delegate")
-                    if delegate is not None and delegate.getSendAsPeers() is not None:
-                        # Группа с каналами — оригинальный попап (с аккаунтами).
-                        orig.onClick(v)
+                    send_as = None
+                    try:
+                        delegate = get_private_field(enter_view, "delegate")
+                        if delegate is not None:
+                            send_as = delegate.getSendAsPeers()
+                    except Exception:
+                        send_as = None
+                    self._diag(
+                        "avatar clicked: dialog={} channels={}".format(
+                            dialog_id, "yes" if send_as is not None else "no"
+                        )
+                    )
+                    if not self._get_accounts_for_list():
+                        # Других аккаунтов нет — оригинальное поведение.
+                        try:
+                            orig.onClick(v)
+                        except Exception:
+                            pass
                         return
+                    # Всегда открываем собственный попап (аккаунты + каналы):
+                    # он не зависит от хука на конструктор SenderSelectPopup.
+                    if not self._show_own_popup(v, enter_view, dialog_id, send_as):
+                        if send_as is not None:
+                            try:
+                                orig.onClick(v)
+                            except Exception:
+                                pass
                 except Exception:
-                    return
-                if not self._get_accounts_for_list():
-                    return
-                dialog_id = get_private_field(enter_view, "dialog_id")
-                self._show_own_popup(v, enter_view, dialog_id)
+                    log(traceback.format_exc())
 
             view.setOnClickListener(OnClickListener(handler))
         except Exception:
@@ -1139,6 +1238,7 @@ class SendAsAccountsPlugin(BasePlugin):
 
     def _on_update_send_as_after(self, param):
         try:
+            self._probe("updateSendAsButton")
             enter_view = param.thisObject
             peer = get_private_field(enter_view, "dialog_id")
             if peer is None or _is_encrypted(peer):
