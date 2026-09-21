@@ -140,7 +140,7 @@ def test_metadata():
                     pass
     check("id", consts.get("__id__") == "send_as_accounts")
     check("name", bool(consts.get("__name__")))
-    check("version", consts.get("__version__") == "1.0.1")
+    check("version", consts.get("__version__") == "1.0.2")
     check("app_version", "12.5.1" in consts.get("__app_version__", ""))
     check("sdk_version", "1.4.4.3" in consts.get("__sdk_version__", ""))
     check("icon", consts.get("__icon__", "").startswith("exteraPlugins"))
@@ -257,97 +257,176 @@ def test_apply_sender_modes():
     check("hybrid encrypted: saved (no switch)", p.get_sender_account(enc) == 2)
 
 
-def test_send_redirect():
-    print("[send redirect]")
+def test_send_redirect_official():
+    print("[send redirect: official hook (SendMessageParams)]")
     p = make_plugin()
     setup_accounts()
     setup_group_chat()
     BulletinHelper.reset()
-    # тесты редиректа прогоняются в режиме «переключение отправителя»
     p.set_setting("switch_mode", MOD.MODE_SWITCH)
 
-    args27 = [None] * 27
-    args27[0] = "hello"
-    args27[10] = -777
-    helper_a0 = _SendMessagesHelper(0)
-
-    calls = []
-    method = _FakeMethod("sendMessage", ["x"] * 27)
-    method.impl = lambda obj, arr: calls.append((obj.account, tuple(arr))) or obj.sendMessage(*arr)
+    check("official hook registered", p._send_msg_hook_added is True)
+    send_counts = [
+        len(m.getParameterTypes())
+        for m, _h in p._hooked_methods
+        if m.getName() == "sendMessage"
+    ]
+    check(
+        "new 7-arg (...,long) not Xposed-hooked",
+        7 not in send_counts and 27 not in send_counts,
+        str(send_counts),
+    )
 
     p._apply_sender(-777, 1)
     check("precondition", p.get_sender_account(-777) == 1)
 
-    param = FakeParam(this_object=helper_a0, args=args27, method=method)
-    p._on_send_before(param)
-    check("original skipped", param.result_set is None)
-    check("redirect happened", len(calls) == 1, str(calls))
-    if calls:
-        check("redirect to account 1", calls[0][0] == 1)
-        check(
-            "boxed long",
-            isinstance(calls[0][1][10], S.java.lang.Long) and int(calls[0][1][10]) == -777,
-        )
-
-    BulletinHelper.reset()
-    p._on_send_after(param)
+    _SendMessagesHelper.SENT.clear()
+    params = S.FakeParams(peer=-777)
+    res = p.on_send_message_hook(0, params)
+    check("result CANCEL", res is not None and res.strategy == S.HookStrategy.CANCEL)
+    check(
+        "sent via account 1",
+        len(_SendMessagesHelper.SENT) == 1 and _SendMessagesHelper.SENT[0][0] == 1,
+        str(_SendMessagesHelper.SENT),
+    )
+    check(
+        "same params object",
+        _SendMessagesHelper.SENT and _SendMessagesHelper.SENT[0][2][0] is params,
+    )
     check(
         "sent-as bulletin",
-        last_bulletin() is not None
-        and last_bulletin()[0] == "info"
+        last_bulletin() is not None and last_bulletin()[0] == "info"
         and "Отправлено от" in last_bulletin()[1],
     )
 
-    BulletinHelper.reset()
-    p._on_send_after(FakeParam(this_object=helper_a0, args=args27, method=method))
-    check("no duplicate bulletin", len(BulletinHelper.SHOWN) == 0)
-
-    p._clear_sender(-777)
-    calls.clear()
-    param2 = FakeParam(this_object=helper_a0, args=args27, method=method)
-    p._on_send_before(param2)
-    check("no redirect without sender", param2.result_set == "UNSET" and len(calls) == 0)
-
-    p._apply_sender(-777, 1)
-    args_retry = list(args27)
-    args_retry[16] = object()
-    calls.clear()
-    param3 = FakeParam(this_object=helper_a0, args=args_retry, method=method)
-    p._on_send_before(param3)
-    check("retry not redirected", len(calls) == 0 and param3.result_set == "UNSET")
-
-    args7 = [None, -777, True, False, True, 0, None]
-    calls.clear()
-    method7 = _FakeMethod("sendMessage", ["a", "long", "b", "b", "b", "i", "o"])
-    method7.impl = lambda obj, arr: calls.append((obj.account, tuple(arr))) or obj.sendMessage(*arr)
-    param4 = FakeParam(this_object=helper_a0, args=args7, method=method7)
-    p._on_send_before(param4)
-    check("forward redirected", len(calls) == 1 and calls[0][0] == 1, str(calls))
-
-    p._apply_sender(555, 1)
-    args27b = list(args27)
-    args27b[10] = 555
-    calls.clear()
-    param5 = FakeParam(this_object=helper_a0, args=args27b, method=method)
-    p._on_send_before(param5)
-    check("private redirected", len(calls) == 1 and calls[0][0] == 1)
-    BulletinHelper.reset()
-    p._on_send_after(param5)
+    _SendMessagesHelper.SENT.clear()
+    res2 = p.on_send_message_hook(1, params)
     check(
-        "private switch-button bulletin",
-        last_bulletin() is not None
-        and last_bulletin()[0] == "button"
-        and "Переключиться" in last_bulletin()[2],
+        "no re-redirect from target",
+        res2.strategy == S.HookStrategy.DEFAULT and not _SendMessagesHelper.SENT,
     )
 
-    enc = 0x4000000000000001
-    p._apply_sender(enc, 1)
-    args27c = list(args27)
-    args27c[10] = enc
-    calls.clear()
-    param6 = FakeParam(this_object=helper_a0, args=args27c, method=method)
-    p._on_send_before(param6)
-    check("encrypted not redirected", len(calls) == 0)
+    _SendMessagesHelper.SENT.clear()
+    res3 = p.on_send_message_hook(0, S.FakeParams(peer=-777, retry=object()))
+    check(
+        "retry not redirected",
+        res3.strategy == S.HookStrategy.DEFAULT and not _SendMessagesHelper.SENT,
+    )
+
+    p._clear_sender(-777)
+    _SendMessagesHelper.SENT.clear()
+    res4 = p.on_send_message_hook(0, params)
+    check(
+        "no sender -> original send",
+        res4.strategy == S.HookStrategy.DEFAULT and not _SendMessagesHelper.SENT,
+    )
+
+    p._apply_sender(555, 1)
+    _SendMessagesHelper.SENT.clear()
+    BulletinHelper.reset()
+    res5 = p.on_send_message_hook(0, S.FakeParams(peer=555))
+    check(
+        "private redirected",
+        res5.strategy == S.HookStrategy.CANCEL
+        and _SendMessagesHelper.SENT and _SendMessagesHelper.SENT[0][0] == 1,
+    )
+    check(
+        "private bulletin with switch button",
+        last_bulletin() is not None and last_bulletin()[0] == "button"
+        and "Переключиться" in last_bulletin()[2],
+        str(last_bulletin()),
+    )
+
+    p._clear_sender(555)
+
+
+def test_send_redirect_legacy():
+    print("[send redirect: legacy Xposed (old API)]")
+    S.set_send_api_arch("old")
+    try:
+        p = make_plugin()
+        setup_accounts()
+        setup_group_chat()
+        BulletinHelper.reset()
+        p.set_setting("switch_mode", MOD.MODE_SWITCH)
+
+        check("official hook NOT registered", p._send_msg_hook_added is False)
+        send_counts = sorted(
+            len(m.getParameterTypes())
+            for m, _h in p._hooked_methods
+            if m.getName() == "sendMessage"
+        )
+        check("legacy 27+7 hooked", send_counts == [7, 27], str(send_counts))
+
+        args27 = [None] * 27
+        args27[0] = "hello"
+        args27[10] = -777
+        helper_a0 = _SendMessagesHelper(0)
+
+        calls = []
+        method = _FakeMethod("sendMessage", ["x"] * 27)
+        method.impl = lambda obj, arr: calls.append((obj.account, tuple(arr))) or obj.sendMessage(*arr)
+
+        p._apply_sender(-777, 1)
+        check("precondition", p.get_sender_account(-777) == 1)
+
+        param = FakeParam(this_object=helper_a0, args=args27, method=method)
+        p._on_send_before(param)
+        check("original skipped", param.result_set is None)
+        check("redirect happened", len(calls) == 1, str(calls))
+        if calls:
+            check("redirect to account 1", calls[0][0] == 1)
+            check(
+                "boxed long",
+                isinstance(calls[0][1][10], S.java.lang.Long) and int(calls[0][1][10]) == -777,
+            )
+
+        BulletinHelper.reset()
+        p._on_send_after(param)
+        check(
+            "sent-as bulletin",
+            last_bulletin() is not None
+            and last_bulletin()[0] == "info"
+            and "Отправлено от" in last_bulletin()[1],
+        )
+
+        BulletinHelper.reset()
+        p._on_send_after(FakeParam(this_object=helper_a0, args=args27, method=method))
+        check("no duplicate bulletin", len(BulletinHelper.SHOWN) == 0)
+
+        p._clear_sender(-777)
+        calls.clear()
+        param2 = FakeParam(this_object=helper_a0, args=args27, method=method)
+        p._on_send_before(param2)
+        check("no redirect without sender", param2.result_set == "UNSET" and len(calls) == 0)
+
+        p._apply_sender(-777, 1)
+        args_retry = list(args27)
+        args_retry[16] = object()
+        calls.clear()
+        param3 = FakeParam(this_object=helper_a0, args=args_retry, method=method)
+        p._on_send_before(param3)
+        check("retry not redirected", len(calls) == 0 and param3.result_set == "UNSET")
+
+        args7 = [None, -777, True, False, True, 0, None]
+        calls.clear()
+        method7 = _FakeMethod("sendMessage", ["a", "long", "b", "b", "b", "i", "o"])
+        method7.impl = lambda obj, arr: calls.append((obj.account, tuple(arr))) or obj.sendMessage(*arr)
+        param4 = FakeParam(this_object=helper_a0, args=args7, method=method7)
+        p._on_send_before(param4)
+        check("forward redirected", len(calls) == 1 and calls[0][0] == 1, str(calls))
+
+        p._apply_sender(555, 1)
+        args27b = list(args27)
+        args27b[10] = 555
+        calls.clear()
+        param5 = FakeParam(this_object=helper_a0, args=args27b, method=method)
+        p._on_send_before(param5)
+        check("private redirected", len(calls) == 1 and calls[0][0] == 1)
+        BulletinHelper.reset()
+        p._on_send_after(param5)
+    finally:
+        S.set_send_api_arch("new")
 
 
 def test_validate_target():
@@ -379,6 +458,11 @@ def test_popup_injection():
     print("[popup injection]")
     BulletinHelper.reset()
     p = make_plugin()
+    # Мост симулирует сломанный hookMethod для конструктора: плагин должен
+    # пройти по фолбэку hook_all_constructors.
+    check("popup fallback used", len(p._hooked_all_ctors) == 1, str(p._hooked_all_ctors))
+    diag_text = "\n".join(p._diag_log)
+    check("popup fallback diag", "ok (all ctors)" in diag_text, diag_text)
     setup_accounts()
     chat_id = setup_group_chat()
 
@@ -807,7 +891,8 @@ def main():
     test_order_and_hidden()
     test_sender_map()
     test_apply_sender_modes()
-    test_send_redirect()
+    test_send_redirect_official()
+    test_send_redirect_legacy()
     test_validate_target()
     test_popup_injection()
     test_private_popup()

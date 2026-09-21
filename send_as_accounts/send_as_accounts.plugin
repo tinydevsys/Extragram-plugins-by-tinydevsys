@@ -22,6 +22,7 @@ Send as Accounts — плагин для exteraGram.
 залогиненных аккаунта.
 """
 
+import sys
 import threading
 import time
 import traceback
@@ -29,6 +30,8 @@ from typing import Any, List
 
 from base_plugin import (
     BasePlugin,
+    HookResult,
+    HookStrategy,
     MethodHook,
     MenuItemData,
     MenuItemType,
@@ -80,7 +83,7 @@ __description__ = (
     "смена аккаунта."
 )
 __author__ = "tinydevsys"
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -168,6 +171,18 @@ def _type_desc(obj):
         return "{}(reflect={})".format(type(obj).__name__, hasattr(obj, "getDeclaredMethod"))
     except Exception:
         return repr(obj)[:60]
+
+
+def _exc_info(exc):
+    """Читаемое описание исключения (для диагностики)."""
+    try:
+        msg = str(exc) or type(exc).__name__
+        return "{}: {}".format(type(exc).__name__, msg)[:250]
+    except Exception:
+        try:
+            return type(exc).__name__
+        except Exception:
+            return "error"
 
 
 # ---------------------------------------------------------------------------
@@ -378,9 +393,9 @@ class SendAsAccountsPlugin(BasePlugin):
 
         try:
             self.menu_item_id = self._add_menu_item()
-        except Exception:
+        except Exception as e:
             log(traceback.format_exc())
-            self._diag("menu item: " + traceback.format_exc().strip().splitlines()[-1])
+            self._diag("menu item: " + _exc_info(e))
             self.menu_item_id = None
 
         self._hook_popup()
@@ -461,21 +476,33 @@ class SendAsAccountsPlugin(BasePlugin):
                 self._diag("popup hook: SenderSelectPopup class not found")
                 return
             self._diag("popup: cls={}".format(_type_desc(cls)))
-            ctor = cls.getDeclaredConstructor(
-                _jclass("android.content.Context"),
-                _jclass("org.telegram.ui.ChatActivity"),
-                _jclass("org.telegram.messenger.MessagesController"),
-                _jclass("org.telegram.tgnet.TLRPC$ChatFull"),
-                _jclass("org.telegram.tgnet.TLRPC$TL_channels_sendAsPeers"),
-                _jclass("org.telegram.ui.Components.SenderSelectPopup$OnSelectCallback"),
-            )
-            ctor.setAccessible(True)
-            self.hook_method(ctor, PopupCtorHook(self))
-            self._hooks_ok += 1
-            self._diag("popup hook: ok")
-        except Exception:
+            try:
+                ctor = cls.getDeclaredConstructor(
+                    _jclass("android.content.Context"),
+                    _jclass("org.telegram.ui.ChatActivity"),
+                    _jclass("org.telegram.messenger.MessagesController"),
+                    _jclass("org.telegram.tgnet.TLRPC$ChatFull"),
+                    _jclass("org.telegram.tgnet.TLRPC$TL_channels_sendAsPeers"),
+                    _jclass("org.telegram.ui.Components.SenderSelectPopup$OnSelectCallback"),
+                )
+                ctor.setAccessible(True)
+                self.hook_method(ctor, PopupCtorHook(self))
+                self._hooks_ok += 1
+                self._diag("popup hook: ok (ctor)")
+            except Exception as e_ctor:
+                # Мост не хукает отдельный конструктор — хукаем все
+                # конструкторы класса (у SenderSelectPopup их один).
+                self._diag(
+                    "popup ctor failed: {} -> hook_all_constructors".format(
+                        _exc_info(e_ctor)
+                    )
+                )
+                self.hook_all_constructors(cls, PopupCtorHook(self))
+                self._hooks_ok += 1
+                self._diag("popup hook: ok (all ctors)")
+        except Exception as e:
             log(traceback.format_exc())
-            self._diag("popup hook: " + traceback.format_exc().strip().splitlines()[-1])
+            self._diag("popup hook: " + _exc_info(e))
 
     def _hook_sender_view(self):
         try:
@@ -488,9 +515,9 @@ class SendAsAccountsPlugin(BasePlugin):
             self.hook_method(m, SenderViewCreateHook(self))
             self._hooks_ok += 1
             self._diag("sender_view hook: ok")
-        except Exception:
+        except Exception as e:
             log(traceback.format_exc())
-            self._diag("sender_view hook: " + traceback.format_exc().strip().splitlines()[-1])
+            self._diag("sender_view hook: " + _exc_info(e))
 
     def _hook_update_send_as(self):
         try:
@@ -503,9 +530,9 @@ class SendAsAccountsPlugin(BasePlugin):
             self.hook_method(m, UpdateSendAsHook(self))
             self._hooks_ok += 1
             self._diag("update_send_as hook: ok")
-        except Exception:
+        except Exception as e:
             log(traceback.format_exc())
-            self._diag("update_send_as hook: " + traceback.format_exc().strip().splitlines()[-1])
+            self._diag("update_send_as hook: " + _exc_info(e))
 
     def _hook_send(self):
         try:
@@ -514,29 +541,53 @@ class SendAsAccountsPlugin(BasePlugin):
                 self.log("Send as Accounts: SendMessagesHelper class not found")
                 self._diag("send hook: SendMessagesHelper class not found")
                 return
-            hooked = 0
-            for m in cls.getDeclaredMethods():
-                if m.getName() != "sendMessage":
-                    continue
-                params = m.getParameterTypes()
-                if len(params) == 27:
-                    # Основной путь отправки (текст/медиа/файлы/опросы).
-                    m.setAccessible(True)
-                    self.hook_method(m, SendRedirectHook(self))
-                    hooked += 1
-                elif len(params) == 7 and params[1].getName() == "long":
-                    # Пересылка сообщений.
-                    m.setAccessible(True)
-                    self.hook_method(m, SendRedirectHook(self))
-                    hooked += 1
-            if hooked:
+            methods = [
+                m for m in cls.getDeclaredMethods() if m.getName() == "sendMessage"
+            ]
+            self._diag(
+                "send: overloads="
+                + ",".join(str(len(m.getParameterTypes())) for m in methods)
+            )
+            # Новая архитектура клиента: весь трафик отправки идёт через
+            # sendMessage(SendMessageParams), в начале которого вызывается
+            # официальный хук плагина executeSendMessageHook — его и
+            # используем (см. on_send_message_hook ниже).
+            has_params_api = any(
+                "SendMessageParams" in m.getParameterTypes()[0].getName()
+                for m in methods
+                if len(m.getParameterTypes()) == 1
+            )
+            if has_params_api:
+                self.add_on_send_message_hook()
                 self._hooks_ok += 1
-                self._diag("send hook: ok ({} methods)".format(hooked))
-            else:
-                self._diag("send hook: no sendMessage overloads found")
-        except Exception:
+                self._diag("send hook: ok (SendMessageParams api)")
+            hooked = 0
+            for m in methods:
+                pt = m.getParameterTypes()
+                n = len(pt)
+                if n == 27:
+                    # Старый API: основной путь отправки.
+                    m.setAccessible(True)
+                    self.hook_method(m, SendRedirectHook(self))
+                    hooked += 1
+                elif n == 7 and pt[1].getName() == "long":
+                    # Старый API: пересылка (…, int, MessageObject).
+                    # Новый API (…, int, long) не хукаем — его закрывает
+                    # официальный хук.
+                    if has_params_api or pt[6].getName() == "long":
+                        continue
+                    m.setAccessible(True)
+                    self.hook_method(m, SendRedirectHook(self))
+                    hooked += 1
+            if not has_params_api:
+                if hooked:
+                    self._hooks_ok += 1
+                    self._diag("send hook: ok ({} legacy methods)".format(hooked))
+                else:
+                    self._diag("send hook: no matching sendMessage overloads")
+        except Exception as e:
             log(traceback.format_exc())
-            self._diag("send hook: " + traceback.format_exc().strip().splitlines()[-1])
+            self._diag("send hook: " + _exc_info(e))
 
     # ------------------------------------------------------------------
     # Состояние и настройки
@@ -695,9 +746,9 @@ class SendAsAccountsPlugin(BasePlugin):
                 return
             self._remember_channels(popup)
             self._inject_accounts(popup, peer)
-        except Exception:
+        except Exception as e:
             log(traceback.format_exc())
-            self._diag("popup inject error: " + traceback.format_exc().strip().splitlines()[-1])
+            self._diag("popup inject error: " + _exc_info(e))
             self._warn_once("popup", "Send as Accounts: не удалось добавить аккаунты в список (см. диагностику)")
 
     # ------------------------------------------------------------------
@@ -1199,6 +1250,79 @@ class SendAsAccountsPlugin(BasePlugin):
     # Перенаправление отправки (группы / ЛС / боты)
     # ------------------------------------------------------------------
 
+    def _show_sent_as_bulletin(self, peer, target):
+        """Плавающее уведомление «отправлено от …» (+кнопка в ЛС)."""
+        try:
+            if not self.get_setting("show_sent_as", True):
+                return
+            name = self._account_name(target)
+            if peer is not None and peer > 0:
+                # ЛС / бот (режим переключения отправителя): предлагаем
+                # переключить приложение на отправителя.
+                def on_switch():
+                    self._switch_app_to(target, reason="bulletin")
+
+                BulletinHelper.show_with_button(
+                    "Отправлено от «{}»".format(name),
+                    R_tg.raw.info,
+                    "Переключиться",
+                    on_switch,
+                )
+            else:
+                BulletinHelper.show_info("Отправлено от «{}»".format(name))
+        except Exception:
+            log(traceback.format_exc())
+
+    def _should_redirect(self, account, peer):
+        """Проверенный аккаунт-отправитель для peer, или None."""
+        target = self.get_sender_account(peer)
+        if target is None or target == account:
+            return None
+        try:
+            if not UserConfig.getInstance(target).isClientActivated():
+                run_on_ui_thread(lambda: self._info("Аккаунт больше не доступен"))
+                self._clear_sender(peer)
+                return None
+        except Exception:
+            pass
+        return self._validate_target(peer, account, target)
+
+    def on_send_message_hook(self, account, params):
+        """Официальный хук исходящих сообщений.
+
+        Срабатывает в начале SendMessagesHelper.sendMessage(params)
+        для каждого аккаунта. Если для чата выбран другой отправитель —
+        выполняем отправку через его SendMessagesHelper и отменяем
+        оригинальную (strategy=CANCEL).
+        """
+        try:
+            peer = getattr(params, "peer", None)
+            if peer is None:
+                return HookResult()
+            peer = int(peer)
+            if getattr(params, "retryMessageObject", None) is not None:
+                return HookResult()
+            if _is_encrypted(peer):
+                return HookResult()
+            target = self._should_redirect(account, peer)
+            if target is None:
+                return HookResult()
+            self._last_redirect = (peer, target)
+            target_helper = AccountInstance.getInstance(target).getSendMessagesHelper()
+            target_helper.sendMessage(params)
+            self._diag("send redirect -> account {} (peer {})".format(target, peer))
+            self._show_sent_as_bulletin(peer, target)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception:
+            self._last_redirect = None
+            log(traceback.format_exc())
+            self._diag("send redirect error: " + _exc_info(sys.exc_info()[1]))
+            self._warn_once(
+                "send",
+                "Не удалось отправить от другого аккаунта — отправлено от текущего",
+            )
+            return HookResult()
+
     def _validate_target(self, peer, cur, target):
         if peer is None or peer > 0:
             return target
@@ -1313,26 +1437,7 @@ class SendAsAccountsPlugin(BasePlugin):
             return
         peer, target = rd
         self._last_redirect = None
-        try:
-            if not self.get_setting("show_sent_as", True):
-                return
-            name = self._account_name(target)
-            if peer is not None and peer > 0:
-                # ЛС / бот (режим переключения отправителя): предлагаем
-                # переключить приложение на отправителя.
-                def on_switch():
-                    self._switch_app_to(target, reason="bulletin")
-
-                BulletinHelper.show_with_button(
-                    "Отправлено от «{}»".format(name),
-                    R_tg.raw.info,
-                    "Переключиться",
-                    on_switch,
-                )
-            else:
-                BulletinHelper.show_info("Отправлено от «{}»".format(name))
-        except Exception:
-            log(traceback.format_exc())
+        self._show_sent_as_bulletin(peer, target)
 
     # ------------------------------------------------------------------
     # Пункт меню чата «Отправлять от…»

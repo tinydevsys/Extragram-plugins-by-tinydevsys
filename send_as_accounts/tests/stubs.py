@@ -224,6 +224,9 @@ class BasePlugin:
 
     def __init__(self):
         self._settings = {}
+        self._hooked_methods = []
+        self._hooked_all_ctors = []
+        self._send_msg_hook_added = False
 
     # lifecycle (переопределяются плагинами)
     def on_plugin_load(self):
@@ -262,8 +265,12 @@ class BasePlugin:
 
     def hook_method(self, method, handler, priority=0):
         if getattr(method, "_is_popup_ctor", False):
-            # Только последний зарегистрированный хук «живой».
-            POPUP_CTOR_HOOKS[:] = [handler]
+            # Симуляция устройства: мост не умеет хукать отдельный
+            # конструктор через hookMethod.
+            raise RuntimeError(
+                "hookMethod: constructor hooking not supported"
+            )
+        self._hooked_methods.append((method, handler))
         return ("hook_stub", method, handler)
 
     def unhook_method(self, obj):
@@ -272,8 +279,14 @@ class BasePlugin:
     def add_hook(self, name, match_substring=False, priority=0):
         pass
 
+    def hook_all_constructors(self, cls, handler, priority=0):
+        self._hooked_all_ctors.append((cls, handler))
+        if getattr(cls, "_name", "") == "org.telegram.ui.Components.SenderSelectPopup":
+            POPUP_CTOR_HOOKS[:] = [handler]
+        return ("hook_stub_all_ctors", cls, handler)
+
     def add_on_send_message_hook(self, priority=0):
-        pass
+        self._send_msg_hook_added = True
 
     def client(self, account=None):
         return None
@@ -958,6 +971,15 @@ tg_messenger.MessagesController = messages_controller
 
 # --- AccountInstance / SendMessagesHelper ---
 
+class FakeParams:
+    """Заглушка SendMessagesHelper.SendMessageParams."""
+
+
+    def __init__(self, peer, retry=None):
+        self.peer = peer
+        self.retryMessageObject = retry
+
+
 class _SendMessagesHelper:
     SENT = []
 
@@ -1332,12 +1354,24 @@ def default_find_class(name):
                 "updateSendAsButton", [_BOOLEAN_TYPE]
             )
         elif name == "org.telegram.messenger.SendMessagesHelper":
-            cls._methods["sendMessage_27"] = _FakeMethod("sendMessage", [_t("x")] * 27)
-            cls._methods["sendMessage_7"] = _FakeMethod(
-                "sendMessage",
-                [_t("java.util.ArrayList"), _t("long"), _t("boolean"),
-                 _t("boolean"), _t("boolean"), _t("int"), _t("o")],
-            )
+            if SEND_API_ARCH == "new":
+                # exteraGram 12.5.2+: весь трафик через SendMessageParams
+                cls._methods["sendMessage_params"] = _FakeMethod(
+                    "sendMessage",
+                    [_t("org.telegram.messenger.SendMessagesHelper$SendMessageParams")],
+                )
+                cls._methods["sendMessage_7_new"] = _FakeMethod(
+                    "sendMessage",
+                    [_t("java.util.ArrayList"), _t("long"), _t("boolean"),
+                     _t("boolean"), _t("boolean"), _t("int"), _t("long")],
+                )
+            else:
+                cls._methods["sendMessage_27"] = _FakeMethod("sendMessage", [_t("x")] * 27)
+                cls._methods["sendMessage_7"] = _FakeMethod(
+                    "sendMessage",
+                    [_t("java.util.ArrayList"), _t("long"), _t("boolean"),
+                     _t("boolean"), _t("boolean"), _t("int"), _t("o")],
+                )
         elif name == "org.telegram.tgnet.RequestCallback":
             pass
         default_find_class._cache[name] = cls
@@ -1345,3 +1379,15 @@ def default_find_class(name):
 
 
 default_find_class._cache = {}
+
+
+SEND_API_ARCH = "new"  # "new" = SendMessageParams (exteraGram 12.5.2+)
+
+
+def set_send_api_arch(arch):
+    """Симуляция старой/новой архитектуры SendMessagesHelper в тестах."""
+    global SEND_API_ARCH
+    SEND_API_ARCH = arch
+    default_find_class._cache.pop(
+        "org.telegram.messenger.SendMessagesHelper", None
+    )
